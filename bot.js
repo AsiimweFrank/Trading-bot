@@ -805,6 +805,25 @@ async function run() {
     return;
   }
 
+  // ── #6 Max drawdown protection: stop if daily loss exceeds threshold ───────
+  const MAX_DAILY_LOSS_USD = parseFloat(process.env.MAX_DAILY_LOSS_USD || "10");
+  const today = new Date().toISOString().slice(0, 10);
+  const closedToday = loadPositions().filter(p =>
+    p.status === "closed" && p.closeTime?.startsWith(today) && p.pnl != null
+  );
+  const dailyPnl = closedToday.reduce((s, p) => s + p.pnl, 0);
+  if (dailyPnl <= -MAX_DAILY_LOSS_USD) {
+    console.log(`  🛑 MAX DRAWDOWN HIT — daily P&L $${dailyPnl.toFixed(2)} ≤ -$${MAX_DAILY_LOSS_USD}. No new trades today.`);
+    await tg(
+`🛑 <b>MAX DRAWDOWN — Bot paused for today</b>
+Daily loss reached $${Math.abs(dailyPnl).toFixed(2)} (limit: $${MAX_DAILY_LOSS_USD})
+No new trades will be placed today.
+Bot resumes automatically tomorrow. 🔄`
+    );
+    return;
+  }
+  console.log(`  💰 Daily P&L: ${dailyPnl >= 0 ? "+" : ""}$${dailyPnl.toFixed(2)} | Drawdown limit: -$${MAX_DAILY_LOSS_USD}`);
+
   // ── Step 0: BTC RSI regime check ─────────────────────────────────────────
   // When BTC RSI > 75, the whole market is in extreme overbought territory.
   // Any asset in a bear stack is now "loaded" — rollover could fire next bar.
@@ -870,6 +889,69 @@ async function run() {
   console.log("\n═══════════════════════════════════════════════════════════");
   console.log(`  Scan complete — ${tradesThisRun} signal(s) fired this run`);
   console.log("═══════════════════════════════════════════════════════════\n");
+
+  // ── #5 Heartbeat: send "bot alive" once per day at first run after 09:00 UTC
+  await sendHeartbeatIfDue(log);
+
+  // ── #4 Daily summary: send P&L recap once per day at first run after 09:00 UTC
+  await sendDailySummaryIfDue(log);
+}
+
+// ─── #4 Daily P&L Summary ────────────────────────────────────────────────────
+async function sendDailySummaryIfDue(log) {
+  const now   = new Date();
+  const hour  = now.getUTCHours();
+  if (hour < 9) return; // only after 09:00 UTC
+
+  const today = now.toISOString().slice(0, 10);
+  const alreadySent = log.trades.some(t => t.dailySummarySent === today);
+  if (alreadySent) return;
+
+  // Gather today's closed trades from CSV
+  const closedToday = (log.trades || []).filter(t =>
+    t.timestamp?.startsWith(today) && t.orderPlaced
+  );
+  const openPositions = loadPositions().filter(p => p.status === "open");
+
+  // Compute P&L from positions closed today
+  const closedPositions = loadPositions().filter(p =>
+    p.status === "closed" && p.closeTime?.startsWith(today) && p.pnl != null
+  );
+  const totalPnl = closedPositions.reduce((s, p) => s + p.pnl, 0);
+  const wins     = closedPositions.filter(p => p.pnl > 0).length;
+  const losses   = closedPositions.filter(p => p.pnl <= 0).length;
+  const wr       = closedPositions.length > 0 ? (wins / closedPositions.length * 100).toFixed(0) : "—";
+  const pnlStr   = totalPnl >= 0 ? `+$${totalPnl.toFixed(2)}` : `-$${Math.abs(totalPnl).toFixed(2)}`;
+  const pnlEmoji = totalPnl >= 0 ? "💚" : "🔴";
+
+  await tg(
+`📊 <b>Daily Summary — ${today}</b>
+${pnlEmoji} P&L:         <b>${pnlStr}</b>
+🎯 Trades:      ${closedPositions.length} closed (${wins}W / ${losses}L)
+📈 Win rate:    ${wr}%
+📂 Open now:   ${openPositions.length} position(s)
+💰 Portfolio:  $${CONFIG.portfolioUSD}
+🤖 Bot:        Running ✅`
+  );
+
+  // Mark as sent
+  log.trades.push({ timestamp: now.toISOString(), dailySummarySent: today, orderPlaced: false });
+  saveLog(log);
+}
+
+// ─── #5 Heartbeat ────────────────────────────────────────────────────────────
+async function sendHeartbeatIfDue(log) {
+  const now  = new Date();
+  const hour = now.getUTCHours();
+  if (hour < 9) return;
+
+  const today = now.toISOString().slice(0, 10);
+  const alreadySent = log.trades.some(t => t.heartbeatSent === today);
+  if (alreadySent) return;
+
+  // heartbeat is folded into daily summary — mark it sent here
+  log.trades.push({ timestamp: now.toISOString(), heartbeatSent: today, orderPlaced: false });
+  saveLog(log);
 }
 
 // Handle --tax-summary flag
