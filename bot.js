@@ -127,14 +127,15 @@ function getTradeSize() {
   return CONFIG.maxTradeSizeUSD;
 }
 
-// Watchlist — v05 with per-asset trend vote tuning
-// trendVote = min bars out of 20 that must be in bear stack (0 = off)
-// BTC needs strict vote (choppy market), ETH/SOL/NEAR trend cleanly (no vote)
+// Watchlist — v05 with per-asset tuning
+// trendVote    = min bars/20 in bear stack (0=off). BTC=12 (choppy regime filter)
+// vwapTimeframe = override VWAP candle TF per asset (default = CONFIG.timeframe = 5m)
+//   ETH VWAP backtest: 5m → 39% WR -$9.93 ❌ | 1H → 100% WR +$0.02 ✅ → use 1H
 const WATCHLIST = [
-  { symbol: "NEARUSDT", okx: "NEAR-USDT", strategy: "vwap_rsi3_ema8", hermesAlso: true,  trendVote: 0  },
-  { symbol: "SOLUSDT",  okx: "SOL-USDT",  strategy: "vwap_rsi3_ema8", hermesAlso: true,  trendVote: 0  },
-  { symbol: "ETHUSDT",  okx: "ETH-USDT",  strategy: "vwap_rsi3_ema8", hermesAlso: true,  trendVote: 0  },
-  { symbol: "BTCUSDT",  okx: "BTC-USDT",  strategy: "vwap_rsi3_ema8",                     trendVote: 12 },
+  { symbol: "NEARUSDT", okx: "NEAR-USDT", strategy: "vwap_rsi3_ema8", hermesAlso: true,  trendVote: 0,  vwapTimeframe: "5m" },
+  { symbol: "SOLUSDT",  okx: "SOL-USDT",  strategy: "vwap_rsi3_ema8", hermesAlso: true,  trendVote: 0,  vwapTimeframe: "5m" },
+  { symbol: "ETHUSDT",  okx: "ETH-USDT",  strategy: "vwap_rsi3_ema8", hermesAlso: true,  trendVote: 0,  vwapTimeframe: "1H" },
+  { symbol: "BTCUSDT",  okx: "BTC-USDT",  strategy: "vwap_rsi3_ema8",                    trendVote: 12, vwapTimeframe: "5m" },
 ];
 
 // ── Persistent data directory ─────────────────────────────────────────────────
@@ -572,8 +573,12 @@ async function processAsset(asset, log) {
 
   // Hermes uses 1H candles for quality signals; VWAP uses 5m
   const isHermes  = asset.strategy === "hermes_v03";
-  const tf        = isHermes ? CONFIG.hermesTimeframe : CONFIG.timeframe;
-  const candleCount = isHermes ? 100 : 200; // 100 × 1H = ~4 days of context
+  // Per-asset VWAP timeframe: ETH uses 1H (backtest: 5m=39%WR -$9.93, 1H=100%WR)
+  // Others use 5m (default). Hermes always uses hermesTimeframe (1H).
+  const tf = isHermes
+    ? CONFIG.hermesTimeframe
+    : (asset.vwapTimeframe || CONFIG.timeframe);
+  const candleCount = (tf === "1H") ? 100 : 200;
 
   const candles = await fetchCandles(asset.okx, tf, candleCount);
   const price   = candles[candles.length - 1].close;
