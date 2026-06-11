@@ -244,18 +244,28 @@ function checkStratHermes(candles, trendVoteMin = 0) {
   const rsiSlope = rsiPrev2 ? (rsiPrev2 - rsi) : 0; // positive = falling
   const strongRollover = rsiSlope >= 1.5;
 
-  if (recentlyAbove55 && crossesBelow52 && notOversold && strongRollover) {
+  // ── Volume spike confirmation: current bar > 1.2× 20-bar average ─────────
+  // RSI rollover WITH volume = real sellers stepping in = high probability
+  // RSI rollover WITHOUT volume = could be noise, price may recover quickly
+  const volumes = candles.map((c) => c.volume);
+  const vol20   = volumes.slice(-21, -1); // last 20 bars excluding current
+  const avgVol  = vol20.length > 0 ? vol20.reduce((a, b) => a + b, 0) / vol20.length : 0;
+  const currVol = volumes[volumes.length - 1];
+  const volRatio     = avgVol > 0 ? currVol / avgVol : 1;
+  const volumeConfirm = volRatio >= 1.2; // current bar volume ≥ 1.2× 20-bar avg
+
+  if (recentlyAbove55 && crossesBelow52 && notOversold && strongRollover && volumeConfirm) {
     return {
       signal: "sell", side: "sell",
-      reason: `HERMES SHORT — bear stack ✅, trend vote ${bearVotes}/${VOTE_BARS} ✅, RSI spiked>55 ✅, crossed below 52 ✅, slope -${rsiSlope.toFixed(1)} ✅, RSI=${rsi.toFixed(1)}>38 ✅`,
-      indicators: { price, ema9, ema21, ema50, rsi, rsiSlope, bearVotes },
+      reason: `HERMES SHORT — bear stack ✅, trend vote ${bearVotes}/${VOTE_BARS} ✅, RSI spiked>55 ✅, crossed below 52 ✅, slope -${rsiSlope.toFixed(1)} ✅, RSI=${rsi.toFixed(1)}>38 ✅, vol ${volRatio.toFixed(2)}×avg ✅`,
+      indicators: { price, ema9, ema21, ema50, rsi, rsiSlope, bearVotes, volRatio },
     };
   }
 
   return {
     signal: null,
-    reason: `bear stack ✅ trend ${bearVotes}/${VOTE_BARS} ✅ — waiting: RSI=${rsi.toFixed(1)} spike=${recentlyAbove55} cross52=${crossesBelow52} slope=${rsiSlope.toFixed(1)}(need≥1.5) floor=${notOversold}`,
-    indicators: { price, ema9, ema21, ema50, rsi, rsiSlope },
+    reason: `bear stack ✅ trend ${bearVotes}/${VOTE_BARS} ✅ — waiting: RSI=${rsi.toFixed(1)} spike=${recentlyAbove55} cross52=${crossesBelow52} slope=${rsiSlope.toFixed(1)}(need≥1.5) floor=${notOversold} vol=${volRatio.toFixed(2)}×(need≥1.2)`,
+    indicators: { price, ema9, ema21, ema50, rsi, rsiSlope, volRatio },
   };
 }
 
