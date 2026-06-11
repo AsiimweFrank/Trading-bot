@@ -815,24 +815,29 @@ async function run() {
     return;
   }
 
-  // ── #6 Max drawdown protection: stop if daily loss exceeds threshold ───────
-  const MAX_DAILY_LOSS_USD = parseFloat(process.env.MAX_DAILY_LOSS_USD || "10");
+  // ── #6 Max drawdown protection — percentage-based, scales with portfolio ────
+  // Default: 3% of portfolio. On $500 = $15. On $2000 = $60. Always proportional.
+  // Override with MAX_DAILY_LOSS_PCT env var (e.g. "5" = 5%).
+  // Why 3%: worst case is 5 trades × 1.5% SL × 10% size = $3.75 on $500.
+  // 3% ($15) = 4× the realistic max, only fires on bugs or extreme conditions.
+  const MAX_DAILY_LOSS_PCT = parseFloat(process.env.MAX_DAILY_LOSS_PCT || "3");
+  const MAX_DAILY_LOSS_USD = CONFIG.portfolioUSD * (MAX_DAILY_LOSS_PCT / 100);
   const today = new Date().toISOString().slice(0, 10);
   const closedToday = loadPositions().filter(p =>
     p.status === "closed" && p.closeTime?.startsWith(today) && p.pnl != null
   );
   const dailyPnl = closedToday.reduce((s, p) => s + p.pnl, 0);
   if (dailyPnl <= -MAX_DAILY_LOSS_USD) {
-    console.log(`  🛑 MAX DRAWDOWN HIT — daily P&L $${dailyPnl.toFixed(2)} ≤ -$${MAX_DAILY_LOSS_USD}. No new trades today.`);
+    console.log(`  🛑 MAX DRAWDOWN HIT — daily P&L $${dailyPnl.toFixed(2)} ≤ -$${MAX_DAILY_LOSS_USD.toFixed(2)} (${MAX_DAILY_LOSS_PCT}% of $${CONFIG.portfolioUSD}). No new trades today.`);
     await tg(
 `🛑 <b>MAX DRAWDOWN — Bot paused for today</b>
-Daily loss reached $${Math.abs(dailyPnl).toFixed(2)} (limit: $${MAX_DAILY_LOSS_USD})
+Daily loss: $${Math.abs(dailyPnl).toFixed(2)} (limit: ${MAX_DAILY_LOSS_PCT}% = $${MAX_DAILY_LOSS_USD.toFixed(2)})
 No new trades will be placed today.
 Bot resumes automatically tomorrow. 🔄`
     );
     return;
   }
-  console.log(`  💰 Daily P&L: ${dailyPnl >= 0 ? "+" : ""}$${dailyPnl.toFixed(2)} | Drawdown limit: -$${MAX_DAILY_LOSS_USD}`);
+  console.log(`  💰 Daily P&L: ${dailyPnl >= 0 ? "+" : ""}$${dailyPnl.toFixed(2)} | Drawdown limit: -$${MAX_DAILY_LOSS_USD.toFixed(2)} (${MAX_DAILY_LOSS_PCT}% of $${CONFIG.portfolioUSD})`);
 
   // ── Step 0: BTC RSI regime check ─────────────────────────────────────────
   // When BTC RSI > 75, the whole market is in extreme overbought territory.
