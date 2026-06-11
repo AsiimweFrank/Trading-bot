@@ -570,6 +570,90 @@ async function processHermesDualScan(asset, log) {
   }
 }
 
+// ─── VWAP Position Exit Manager ──────────────────────────────────────────────
+// Checks open VWAP spot positions every run:
+//   Exit 1 — RSI(3) crosses above 50 (take profit — trend exhausted)
+//   Exit 2 — Price drops 0.3% below entry (stop loss)
+// Places a real spot SELL order and marks position closed.
+
+async function checkVwapPositions(log) {
+  const positions = loadPositions();
+  const openVwap  = positions.filter(
+    (p) => p.status === "open" && p.tp1 === null  // VWAP has no tp1/tp2
+  );
+  if (!openVwap.length) return;
+
+  console.log(`\n─── VWAP Exit Manager (${openVwap.length} open) ─────────────────`);
+
+  for (const pos of openVwap) {
+    const okxSymbol = pos.symbol.replace("USDT", "-USDT");
+    let candles;
+    try {
+      candles = await fetchCandles(okxSymbol, CONFIG.timeframe, 20);
+    } catch (e) {
+      console.log(`  ⚠️  ${pos.symbol} fetch failed: ${e.message}`);
+      continue;
+    }
+
+    const closes = candles.map((c) => c.close);
+    const price  = closes[closes.length - 1];
+    const rsi3   = calcRSI(closes, 3);
+    const rsi3Prev = calcRSI(closes.slice(0, -1), 3);
+    const pct    = ((price - pos.entry) / pos.entry * 100).toFixed(2);
+    const sl     = pos.entry * (1 - 0.003); // 0.3% stop loss
+
+    console.log(`  ${pos.symbol}: entry=$${pos.entry} now=$${price.toFixed(4)} P&L=${pct}% | RSI3=${rsi3?.toFixed(1)} SL=$${sl.toFixed(4)}`);
+
+    let exitReason = null;
+
+    // Exit 1: RSI(3) crosses above 50 — trend exhausted, take profit
+    if (rsi3 && rsi3Prev && rsi3Prev < 50 && rsi3 >= 50) {
+      exitReason = "rsi3_cross_50";
+      console.log(`  🎯 RSI(3) crossed 50 — taking profit @ $${price.toFixed(4)} | P&L: ${pct}%`);
+    }
+    // Exit 2: stop loss hit
+    else if (price <= sl) {
+      exitReason = "stop_loss";
+      console.log(`  🛑 SL HIT @ $${price.toFixed(4)} | P&L: ${pct}%`);
+    }
+    // Exit 3: 4-hour time expiry (fallback)
+    else {
+      const ageHrs = (Date.now() - new Date(pos.openTime).getTime()) / 3600000;
+      if (ageHrs >= 4) {
+        exitReason = "time_expiry_4h";
+        console.log(`  ⏱️  4h expiry — closing @ $${price.toFixed(4)} | P&L: ${pct}%`);
+      }
+    }
+
+    if (exitReason) {
+      // Place real spot SELL to return tokens → USDT
+      if (!CONFIG.paperTrading) {
+        try {
+          await placeBybitOrder(pos.symbol, "sell", pos.size, price, "spot");
+          console.log(`  ✅ VWAP SELL placed — ${pos.size} USD of ${pos.symbol} sold`);
+        } catch (e) {
+          console.log(`  ❌ VWAP sell failed: ${e.message}`);
+        }
+      }
+      const pnlUSD = (price - pos.entry) / pos.entry * pos.size;
+      writeTradeCsv({
+        symbol: pos.symbol, strategy: "vwap_rsi3_ema8",
+        side: "sell", price, tradeSize: pos.size,
+        mode: CONFIG.paperTrading ? "PAPER" : "LIVE-SPOT",
+        signal: `EXIT_${exitReason} pnl=$${pnlUSD.toFixed(2)}`,
+      });
+      pos.status     = "closed";
+      pos.closeReason = exitReason;
+      pos.closePrice  = price;
+      pos.closeTime   = new Date().toISOString();
+      pos.pnl         = pnlUSD;
+      log.trades.push({ timestamp: new Date().toISOString(), symbol: pos.symbol, side: "sell", price, orderPlaced: true, reason: exitReason });
+    }
+  }
+
+  savePositions(positions);
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function run() {
@@ -601,8 +685,11 @@ async function run() {
     return;
   }
 
-  // ── Step 1: Check open Hermes positions for TP/SL exits ──────────────────
+  // ── Step 1a: Check open Hermes positions (perpetual TP/SL exits) ─────────
   await checkHermesPositions(log);
+
+  // ── Step 1b: Check open VWAP positions (spot RSI exit + SL + expiry) ─────
+  await checkVwapPositions(log);
 
   // ── Step 2: Scan each asset for new entries ───────────────────────────────
   let tradesThisRun = 0;
