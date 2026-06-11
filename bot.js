@@ -1,16 +1,17 @@
 /**
- * Claude Trading Bot — Multi-Asset, Dual Strategy
+ * Claude Trading Bot — Multi-Asset, Multi-Timeframe (v05)
  *
  * Watchlist & strategy assignment (backtest v04 — 5m 30d):
- *   NEAR  → VWAP primary + Hermes dual [Hermes 95.5% WR ← best asset]
- *   SOL   → VWAP primary + Hermes dual [Hermes 83.1% WR, 59 trades]
- *   ETH   → Hermes v04               [85.7% WR]
- *   BTC   → VWAP + RSI(3) + EMA(8)   [Hermes WR dropped to 43.9% — paused]
+ *   NEAR  → VWAP(5m) primary + Hermes(1H) dual [Hermes 95.5% WR ← best]
+ *   SOL   → VWAP(5m) primary + Hermes(1H) dual [Hermes 83.1% WR]
+ *   ETH   → Hermes(1H)                          [85.7% WR]
+ *   BTC   → VWAP(5m) + RSI(3) + EMA(8)          [Hermes paused — 43.9%]
  *
- * Improvements (v04):
- *   - Hermes positions tracked in positions.json
- *   - Partial TP: 50% exit at 1.5%, SL moves to breakeven, rest runs to 3.0%
- *   - NEAR also scanned for Hermes setups (confirmed live signal 2026-06-11)
+ * Improvements (v05):
+ *   - Hermes now scans 1H candles (matches live scan that caught NEAR +$1.125)
+ *   - VWAP strategies keep 5m (session-based, works best on short TF)
+ *   - Partial TP: 50% at 1.5%, SL→BE, rest at 3.0%
+ *   - Full position tracking in positions.json
  *
  * Data: OKX public API | Execution: Bybit Demo
  * Runs every 5 minutes on Railway cron
@@ -23,11 +24,12 @@ import crypto from "crypto";
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const CONFIG = {
-  timeframe:      process.env.TIMEFRAME       || "5m",
-  maxTradeSizeUSD:parseFloat(process.env.MAX_TRADE_SIZE_USD  || "50"),
-  maxTradesPerDay:parseInt(process.env.MAX_TRADES_PER_DAY    || "5"),
-  paperTrading:   process.env.PAPER_TRADING   !== "false",
-  tradeMode:      process.env.TRADE_MODE      || "spot",
+  timeframe:       process.env.TIMEFRAME        || "5m",   // VWAP strategies
+  hermesTimeframe: process.env.HERMES_TIMEFRAME || "1H",   // Hermes — 1H for quality signals
+  maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD  || "50"),
+  maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY    || "5"),
+  paperTrading:    process.env.PAPER_TRADING   !== "false",
+  tradeMode:       process.env.TRADE_MODE      || "spot",
   bybit: {
     apiKey:    process.env.BYBIT_API_KEY,
     secretKey: process.env.BYBIT_SECRET_KEY,
@@ -307,11 +309,11 @@ async function checkHermesPositions(log) {
   console.log(`\n─── Hermes Position Manager (${open.length} open) ──────────────`);
 
   for (const pos of open) {
-    // Fetch current price
+    // Fetch current price (use 5m for tight exit tracking)
     const okxSymbol = pos.symbol.replace("USDT", "-USDT");
     let price;
     try {
-      const candles = await fetchCandles(okxSymbol, CONFIG.timeframe, 5);
+      const candles = await fetchCandles(okxSymbol, "5m", 5);
       price = candles[candles.length - 1].close;
     } catch (e) {
       console.log(`  ⚠️  ${pos.symbol} price fetch failed: ${e.message}`);
@@ -369,17 +371,22 @@ async function checkHermesPositions(log) {
 async function processAsset(asset, log) {
   console.log(`\n─── ${asset.symbol} [${asset.strategy}] ─────────────────────`);
 
-  const candles = await fetchCandles(asset.okx, CONFIG.timeframe, 200);
+  // Hermes uses 1H candles for quality signals; VWAP uses 5m
+  const isHermes  = asset.strategy === "hermes_v03";
+  const tf        = isHermes ? CONFIG.hermesTimeframe : CONFIG.timeframe;
+  const candleCount = isHermes ? 100 : 200; // 100 × 1H = ~4 days of context
+
+  const candles = await fetchCandles(asset.okx, tf, candleCount);
   const price   = candles[candles.length - 1].close;
-  console.log(`  Price: $${price.toFixed(4)}`);
+  console.log(`  Price: $${price.toFixed(4)} [${tf}]`);
 
   // Run the assigned strategy
-  const result = asset.strategy === "hermes_v03"
+  const result = isHermes
     ? checkStratHermes(candles)
     : checkStratVwapRsi(candles);
 
   const ind = result.indicators || {};
-  if (asset.strategy === "hermes_v03") {
+  if (isHermes) {
     if (ind.ema9)  console.log(`  EMA9/21/50: ${ind.ema9?.toFixed(2)} / ${ind.ema21?.toFixed(2)} / ${ind.ema50?.toFixed(2)}`);
     if (ind.rsi)   console.log(`  RSI(14): ${ind.rsi?.toFixed(2)}`);
   } else {
@@ -419,17 +426,17 @@ async function processAsset(asset, log) {
   }
 }
 
-// ─── Dual-scan: run Hermes on VWAP assets (NEAR + SOL) ───────────────────────
+// ─── Dual-scan: run Hermes(1H) on VWAP assets (NEAR + SOL) ──────────────────
 async function processHermesDualScan(asset, log) {
-  const candles = await fetchCandles(asset.okx, CONFIG.timeframe, 200);
+  const candles = await fetchCandles(asset.okx, CONFIG.hermesTimeframe, 100);
   const result  = checkStratHermes(candles);
   if (!result.signal) {
-    console.log(`  ⏸  ${asset.symbol} Hermes dual: ${result.reason}`);
+    console.log(`  ⏸  ${asset.symbol} Hermes(${CONFIG.hermesTimeframe}) dual: ${result.reason}`);
     return false;
   }
   const price     = candles[candles.length - 1].close;
   const tradeSize = CONFIG.maxTradeSizeUSD;
-  console.log(`  🎯 ${asset.symbol} HERMES SIGNAL: ${result.side.toUpperCase()} — ${result.reason}`);
+  console.log(`  🎯 ${asset.symbol} HERMES(${CONFIG.hermesTimeframe}) SIGNAL: ${result.side.toUpperCase()} — ${result.reason}`);
   if (CONFIG.paperTrading) {
     writeTradeCsv({ symbol: asset.symbol, strategy: "hermes_v04", side: result.side, price, tradeSize, mode: "PAPER", signal: result.reason });
     log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: result.side, price, orderPlaced: true, paper: true });
