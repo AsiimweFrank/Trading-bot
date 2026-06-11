@@ -235,17 +235,19 @@ function checkStratVwapRsi(candles) {
   const bullish = price > vwap && price > ema8;
   const bearish = price < vwap && price < ema8;
 
-  if (bullish && rsi3 < 30) {
+  // Use <= 30 / >= 70 — RSI exactly at 30 or 70 is still oversold/overbought.
+  // Strict < 30 was missing signals where RSI3 = 30.0 exactly (rounded value).
+  if (bullish && rsi3 <= 30) {
     return {
       signal: "buy", side: "buy",
-      reason: `BULLISH — price>VWAP, price>EMA8, RSI3=${rsi3.toFixed(1)}<30`,
+      reason: `BULLISH — price>VWAP, price>EMA8, RSI3=${rsi3.toFixed(1)}≤30`,
       indicators: { price, ema8, vwap, rsi3 },
     };
   }
-  if (bearish && rsi3 > 70) {
+  if (bearish && rsi3 >= 70) {
     return {
       signal: "sell", side: "sell",
-      reason: `BEARISH — price<VWAP, price<EMA8, RSI3=${rsi3.toFixed(1)}>70`,
+      reason: `BEARISH — price<VWAP, price<EMA8, RSI3=${rsi3.toFixed(1)}≥70`,
       indicators: { price, ema8, vwap, rsi3 },
     };
   }
@@ -253,7 +255,7 @@ function checkStratVwapRsi(candles) {
   const bias = bullish ? "BULLISH" : bearish ? "BEARISH" : "NEUTRAL";
   return {
     signal: null,
-    reason: `${bias} bias — RSI3=${rsi3.toFixed(1)} (need <30 long / >70 short)`,
+    reason: `${bias} bias — RSI3=${rsi3.toFixed(1)} (need ≤30 long / ≥70 short)`,
     indicators: { price, ema8, vwap, rsi3 },
   };
 }
@@ -755,6 +757,17 @@ async function checkVwapPositions(log) {
       pos.closeTime   = new Date().toISOString();
       pos.pnl         = pnlUSD;
       log.trades.push({ timestamp: new Date().toISOString(), symbol: pos.symbol, side: "sell", price, orderPlaced: true, reason: exitReason });
+
+      // Telegram exit alert
+      const exitEmoji = { rsi3_cross_50: "✅", stop_loss: "🛑", time_expiry_4h: "⏱️" };
+      const exitLabel = { rsi3_cross_50: "RSI3 crossed 50 — trend done", stop_loss: "Stop loss hit", time_expiry_4h: "4H time expiry" };
+      await tg(
+`${exitEmoji[exitReason]||"🔔"} <b>VWAP EXIT — ${pos.symbol}</b>
+📍 Entry:  $${pos.entry}
+📤 Exit:   $${price.toFixed(4)}
+💵 P&L:    ${pnlUSD >= 0 ? "+" : ""}$${pnlUSD.toFixed(2)}
+📋 Reason: ${exitLabel[exitReason]||exitReason}`
+      );
     }
   }
 
