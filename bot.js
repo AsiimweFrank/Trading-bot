@@ -319,15 +319,17 @@ function checkStratHermes(candles, trendVoteMin = 0) {
   const rsiSlope = rsiPrev2 ? (rsiPrev2 - rsi) : 0; // positive = falling
   const strongRollover = rsiSlope >= 1.5;
 
-  // ── Volume spike confirmation: current bar > 1.2× 20-bar average ─────────
-  // RSI rollover WITH volume = real sellers stepping in = high probability
-  // RSI rollover WITHOUT volume = could be noise, price may recover quickly
-  const volumes = candles.map((c) => c.volume);
-  const vol20   = volumes.slice(-21, -1); // last 20 bars excluding current
-  const avgVol  = vol20.length > 0 ? vol20.reduce((a, b) => a + b, 0) / vol20.length : 0;
-  const currVol = volumes[volumes.length - 1];
-  const volRatio     = avgVol > 0 ? currVol / avgVol : 1;
-  const volumeConfirm = volRatio >= 1.2; // current bar volume ≥ 1.2× 20-bar avg
+  // ── Volume spike confirmation: PREVIOUS completed bar > 1.2× 20-bar average
+  // IMPORTANT: use index -2 (last CLOSED bar), not -1 (current forming bar).
+  // The current 1H bar is always partial — its volume starts near zero and builds.
+  // Checking it would block every signal early in the hour regardless of real volume.
+  // The previous closed bar gives the true volume reading for the RSI rollover bar.
+  const volumes  = candles.map((c) => c.volume);
+  const prevVol  = volumes[volumes.length - 2]; // last COMPLETED bar
+  const vol20    = volumes.slice(-22, -2);       // 20 bars before that
+  const avgVol   = vol20.length > 0 ? vol20.reduce((a, b) => a + b, 0) / vol20.length : 0;
+  const volRatio      = avgVol > 0 ? prevVol / avgVol : 1;
+  const volumeConfirm = volRatio >= 1.2;
 
   if (recentlyAbove55 && crossesBelow52 && notOversold && strongRollover && volumeConfirm) {
     return {
