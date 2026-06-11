@@ -24,18 +24,33 @@ import crypto from "crypto";
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const CONFIG = {
-  timeframe:       process.env.TIMEFRAME        || "5m",   // VWAP strategies
-  hermesTimeframe: process.env.HERMES_TIMEFRAME || "1H",   // Hermes — 1H for quality signals
-  maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD  || "50"),
-  maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY    || "5"),
-  paperTrading:    process.env.PAPER_TRADING   !== "false",
-  tradeMode:       process.env.TRADE_MODE      || "spot",
+  timeframe:        process.env.TIMEFRAME         || "5m",   // VWAP strategies
+  hermesTimeframe:  process.env.HERMES_TIMEFRAME  || "1H",   // Hermes — 1H for quality signals
+  // Position sizing — percentage-based so trade size grows with account
+  // TRADE_SIZE_PCT takes priority over MAX_TRADE_SIZE_USD if set
+  tradeSizePct:     parseFloat(process.env.TRADE_SIZE_PCT     || "0"),    // e.g. 10 = 10% of portfolio
+  portfolioUSD:     parseFloat(process.env.PORTFOLIO_VALUE_USD || "500"), // current account size
+  maxTradeSizeUSD:  parseFloat(process.env.MAX_TRADE_SIZE_USD  || "50"),  // fallback fixed size
+  maxTradesPerDay:  parseInt(process.env.MAX_TRADES_PER_DAY    || "5"),
+  paperTrading:     process.env.PAPER_TRADING    !== "false",
+  tradeMode:        process.env.TRADE_MODE       || "spot",
   bybit: {
     apiKey:    process.env.BYBIT_API_KEY,
     secretKey: process.env.BYBIT_SECRET_KEY,
     baseUrl:   process.env.BYBIT_BASE_URL || "https://api.bybit.com",
   },
 };
+
+// Resolve trade size: % of portfolio if TRADE_SIZE_PCT set, else fixed USD
+function getTradeSize() {
+  if (CONFIG.tradeSizePct > 0) {
+    const pctSize = CONFIG.portfolioUSD * (CONFIG.tradeSizePct / 100);
+    // Cap at 30% max per trade for safety
+    const capped = Math.min(pctSize, CONFIG.portfolioUSD * 0.30);
+    return Math.round(capped * 100) / 100;
+  }
+  return CONFIG.maxTradeSizeUSD;
+}
 
 // Watchlist — v05 with per-asset trend vote tuning
 // trendVote = min bars out of 20 that must be in bear stack (0 = off)
@@ -425,7 +440,7 @@ async function processAsset(asset, log) {
 
   console.log(`  🎯 SIGNAL: ${result.side.toUpperCase()} — ${result.reason}`);
 
-  const tradeSize = CONFIG.maxTradeSizeUSD;
+  const tradeSize = getTradeSize();
 
   if (CONFIG.paperTrading) {
     console.log(`  📋 PAPER: Would ${result.side.toUpperCase()} $${tradeSize} of ${asset.symbol} @ $${price.toFixed(4)}`);
@@ -460,7 +475,7 @@ async function processHermesDualScan(asset, log) {
     return false;
   }
   const price     = candles[candles.length - 1].close;
-  const tradeSize = CONFIG.maxTradeSizeUSD;
+  const tradeSize = getTradeSize();
   console.log(`  🎯 ${asset.symbol} HERMES(${CONFIG.hermesTimeframe}) SIGNAL: ${result.side.toUpperCase()} — ${result.reason}`);
   if (CONFIG.paperTrading) {
     writeTradeCsv({ symbol: asset.symbol, strategy: "hermes_v04", side: result.side, price, tradeSize, mode: "PAPER", signal: result.reason });
@@ -494,7 +509,11 @@ async function run() {
   console.log("  Claude Trading Bot — Multi-Asset");
   console.log(`  ${new Date().toISOString()}`);
   console.log(`  Mode: ${CONFIG.paperTrading ? "📋 PAPER TRADING" : "🔴 LIVE TRADING"}`);
-  console.log(`  Timeframe: ${CONFIG.timeframe} | Max trade: $${CONFIG.maxTradeSizeUSD}`);
+  const tradeSize = getTradeSize();
+  const sizeLabel = CONFIG.tradeSizePct > 0
+    ? `${CONFIG.tradeSizePct}% of $${CONFIG.portfolioUSD} = $${tradeSize}`
+    : `$${tradeSize} fixed`;
+  console.log(`  Timeframe: ${CONFIG.timeframe} | Trade size: ${sizeLabel}`);
   console.log("═══════════════════════════════════════════════════════════");
 
   // Daily trade limit check
