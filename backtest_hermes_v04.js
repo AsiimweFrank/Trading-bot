@@ -60,9 +60,9 @@ function calcRSI(closes, period = 14) {
   return 100 - 100 / (1 + gains / losses);
 }
 
-// ─── Entry signal (shared by both versions) ───────────────────────────────────
+// ─── Entry signal ─────────────────────────────────────────────────────────────
 
-function hermesSignal(closes, i) {
+function hermesSignal(closes, i, useTrendVote = false) {
   const price   = closes[i];
   const ema9    = calcEMA(closes.slice(0, i + 1), 9);
   const ema21   = calcEMA(closes.slice(0, i + 1), 21);
@@ -74,6 +74,19 @@ function hermesSignal(closes, i) {
   const bearStack = ema9 < ema21 && ema21 < ema50 && price < ema50;
   if (!bearStack) return false;
 
+  // Trend strength vote (v05): 12/20 recent bars must be in bear stack
+  if (useTrendVote) {
+    const VOTE_BARS = 20, VOTE_MIN = 12;
+    let votes = 0;
+    for (let j = Math.max(0, i - VOTE_BARS + 1); j <= i; j++) {
+      const cl = closes.slice(0, j + 1);
+      const e9 = calcEMA(cl, 9), e21 = calcEMA(cl, 21), e50 = calcEMA(cl, 50);
+      const p  = cl[cl.length - 1];
+      if (e9 && e21 && e50 && e9 < e21 && e21 < e50 && p < e50) votes++;
+    }
+    if (votes < VOTE_MIN) return false;
+  }
+
   const rsiWindow = [];
   for (let j = Math.max(0, i - 4); j <= i; j++) {
     const r = calcRSI(closes.slice(0, j + 1), 14);
@@ -82,7 +95,7 @@ function hermesSignal(closes, i) {
   return rsiWindow.some((r) => r > 55) && rsiPrev >= 52 && rsi < 52 && rsi > 38;
 }
 
-// ─── v03: single TP at 3%, SL at 1.5% ────────────────────────────────────────
+// ─── v03: single TP at 3%, SL at 1.5% (no trend vote) ───────────────────────
 
 function backtestV03(candles) {
   const closes = candles.map((c) => c.close);
@@ -106,8 +119,46 @@ function backtestV03(candles) {
       }
     }
 
-    if (!pos && hermesSignal(closes, i)) {
+    if (!pos && hermesSignal(closes, i, false)) {
       pos = { entry: price, sl: price * 1.015, tp: price * 0.970 };
+    }
+  }
+  return trades;
+}
+
+// ─── v05: partial TP + trend strength vote (12/20 bars) ──────────────────────
+
+function backtestV05(candles) {
+  const closes = candles.map((c) => c.close);
+  const trades = [];
+  let pos = null;
+
+  for (let i = 60; i < candles.length; i++) {
+    const price = closes[i];
+
+    if (pos) {
+      const rsi     = calcRSI(closes.slice(0, i + 1), 14);
+      const activeSL = pos.tp1Hit ? pos.slBE : pos.sl;
+
+      if (!pos.tp1Hit && price <= pos.tp1) {
+        trades.push({ entry: pos.entry, exitPrice: pos.tp1, pnl: (pos.entry - pos.tp1) / pos.entry * (TRADE_SIZE * 0.5), exit: "tp1" });
+        pos.tp1Hit = true; pos.slBE = pos.entry * 1.001;
+      } else if (pos.tp1Hit && price <= pos.tp2) {
+        trades.push({ entry: pos.entry, exitPrice: pos.tp2, pnl: (pos.entry - pos.tp2) / pos.entry * (TRADE_SIZE * 0.5), exit: "tp2" });
+        pos = null;
+      } else if (price >= activeSL) {
+        const rem = pos.tp1Hit ? TRADE_SIZE * 0.5 : TRADE_SIZE;
+        trades.push({ entry: pos.entry, exitPrice: activeSL, pnl: (pos.entry - activeSL) / pos.entry * rem, exit: pos.tp1Hit ? "sl_be" : "sl" });
+        pos = null;
+      } else if (rsi && rsi < 38) {
+        const rem = pos.tp1Hit ? TRADE_SIZE * 0.5 : TRADE_SIZE;
+        trades.push({ entry: pos.entry, exitPrice: price, pnl: (pos.entry - price) / pos.entry * rem, exit: "rsi_os" });
+        pos = null;
+      }
+    }
+
+    if (!pos && hermesSignal(closes, i, true)) {  // ← trend vote ON
+      pos = { entry: closes[i], sl: closes[i]*1.015, tp1: closes[i]*0.985, tp2: closes[i]*0.970, slBE: null, tp1Hit: false };
     }
   }
   return trades;
@@ -218,27 +269,29 @@ function stats(trades, label) {
     console.log(`${candles.length} bars`);
 
     const v03trades = backtestV03(candles);
-    const v04trades = backtestV04(candles);
+    const v05trades = backtestV05(candles);
 
     const sv3 = stats(v03trades, "v03");
-    const sv4 = stats(v04trades, "v04");
+    const sv5 = stats(v05trades, "v05");
 
-    allRows.push({ symbol, sv3, sv4 });
+    allRows.push({ symbol, sv3, sv5 });
 
     const fmt = (s) => `║ ${symbol.padEnd(13)} ║ ${s.label.padEnd(5)} ║ ${String(s.n).padEnd(7)} ║ ${s.wr.padEnd(10)} ║ ${s.pnl.padEnd(6)} ║ ${s.pf.padEnd(5)} ║ ${s.maxDD.padEnd(9)} ║`;
     console.log(fmt(sv3));
-    console.log(fmt(sv4));
+    console.log(fmt(sv5));
     console.log("╠═══════════════╬═══════╬═════════╬════════════╬════════╬═══════╬═══════════╣");
   }
 
   console.log("╚═══════════════╩═══════╩═════════╩════════════╩════════╩═══════╩═══════════╝");
 
-  console.log("\n📊 IMPROVEMENT SUMMARY (v04 vs v03):");
-  for (const { symbol, sv3, sv4 } of allRows) {
+  console.log("\n📊 IMPROVEMENT SUMMARY (v05 trend-vote vs v03 baseline):");
+  for (const { symbol, sv3, sv5 } of allRows) {
     if (sv3.n === 0) continue;
-    const pnlDiff = (parseFloat(sv4.pnl.replace("$","")) - parseFloat(sv3.pnl.replace("$",""))).toFixed(2);
+    const pnlDiff = (parseFloat(sv5.pnl.replace("$","").replace("-$","-")) - parseFloat(sv3.pnl.replace("$","").replace("-$","-"))).toFixed(2);
     const sign = pnlDiff >= 0 ? "+" : "";
-    console.log(`  ${symbol}: WR ${sv3.wr} → ${sv4.wr} | P&L ${sv3.pnl} → ${sv4.pnl} (${sign}$${pnlDiff}) | MaxDD ${sv3.maxDD} → ${sv4.maxDD}`);
+    const tradeChange = sv5.n - sv3.n;
+    const tradeSign = tradeChange >= 0 ? "+" : "";
+    console.log(`  ${symbol}: WR ${sv3.wr} → ${sv5.wr} | P&L ${sv3.pnl} → ${sv5.pnl} (${sign}$${pnlDiff}) | Trades ${sv3.n}→${sv5.n} (${tradeSign}${tradeChange}) | MaxDD ${sv3.maxDD} → ${sv5.maxDD}`);
   }
 
   console.log("\n✅ Done.\n");

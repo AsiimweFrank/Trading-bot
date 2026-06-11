@@ -37,14 +37,14 @@ const CONFIG = {
   },
 };
 
-// Watchlist — updated from backtest_hermes_v04 results (2026-06-11)
-// BTC Hermes WR fell to 43.9% in recent 30d → switched to VWAP
-// SOL added to Hermes dual-scan (83.1% WR, most signals of any asset)
+// Watchlist — v05 with per-asset trend vote tuning
+// trendVote = min bars out of 20 that must be in bear stack (0 = off)
+// BTC needs strict vote (choppy market), ETH/SOL/NEAR trend cleanly (no vote)
 const WATCHLIST = [
-  { symbol: "NEARUSDT", okx: "NEAR-USDT", strategy: "vwap_rsi3_ema8", hermesAlso: true  },
-  { symbol: "SOLUSDT",  okx: "SOL-USDT",  strategy: "vwap_rsi3_ema8", hermesAlso: true  },
-  { symbol: "ETHUSDT",  okx: "ETH-USDT",  strategy: "hermes_v03"                        },
-  { symbol: "BTCUSDT",  okx: "BTC-USDT",  strategy: "vwap_rsi3_ema8"                    },
+  { symbol: "NEARUSDT", okx: "NEAR-USDT", strategy: "vwap_rsi3_ema8", hermesAlso: true,  trendVote: 0  },
+  { symbol: "SOLUSDT",  okx: "SOL-USDT",  strategy: "vwap_rsi3_ema8", hermesAlso: true,  trendVote: 0  },
+  { symbol: "ETHUSDT",  okx: "ETH-USDT",  strategy: "hermes_v03",                         trendVote: 0  },
+  { symbol: "BTCUSDT",  okx: "BTC-USDT",  strategy: "vwap_rsi3_ema8",                     trendVote: 12 },
 ];
 
 const LOG_FILE      = "safety-check-log.json";
@@ -162,10 +162,11 @@ function checkStratVwapRsi(candles) {
   };
 }
 
-// ─── Strategy B: Hermes v03 — RSI Rejection in Downtrend ─────────────────────
-// Best for: BTC (84.4% WR), ETH (100% WR)
+// ─── Strategy B: Hermes v05 — RSI Rejection in Downtrend ─────────────────────
+// Scans 1H candles. Best for: NEAR (95.5%), ETH (85.7%), SOL (83.1%)
+// v05 adds: trend strength vote (12/20 bars in bear stack = no choppy entries)
 
-function checkStratHermes(candles) {
+function checkStratHermes(candles, trendVoteMin = 0) {
   const closes  = candles.map((c) => c.close);
   const price   = closes[closes.length - 1];
   const ema9    = calcEMA(closes, 9);
@@ -186,6 +187,30 @@ function checkStratHermes(candles) {
     };
   }
 
+  // ── Trend strength vote (per-asset, 0 = disabled) ────────────────────────
+  // BTC: 12/20 bars required (choppy market fix)
+  // ETH/SOL/NEAR: 0 (naturally trending, don't over-filter)
+  const VOTE_BARS  = 20;
+  const VOTE_MIN   = trendVoteMin;
+  let bearVotes = 0;
+  const start = Math.max(0, candles.length - VOTE_BARS);
+  for (let j = start; j < candles.length; j++) {
+    const c = candles.slice(0, j + 1);
+    const cl = c.map((x) => x.close);
+    const e9  = calcEMA(cl, 9);
+    const e21 = calcEMA(cl, 21);
+    const e50 = calcEMA(cl, 50);
+    const p   = cl[cl.length - 1];
+    if (e9 && e21 && e50 && e9 < e21 && e21 < e50 && p < e50) bearVotes++;
+  }
+  if (VOTE_MIN > 0 && bearVotes < VOTE_MIN) {
+    return {
+      signal: null,
+      reason: `bear stack ✅ but trend too weak (${bearVotes}/${VOTE_BARS} bars in bear stack, need ${VOTE_MIN})`,
+      indicators: { price, ema9, ema21, ema50, rsi },
+    };
+  }
+
   // RSI spike check: was RSI > 55 in last 5 bars?
   const rsiWindow = [];
   for (let j = Math.max(0, candles.length - 5); j < candles.length; j++) {
@@ -199,14 +224,14 @@ function checkStratHermes(candles) {
   if (recentlyAbove55 && crossesBelow52 && notOversold) {
     return {
       signal: "sell", side: "sell",
-      reason: `HERMES SHORT — bear stack ✅, RSI spiked>55 ✅, crossed below 52 ✅, RSI=${rsi.toFixed(1)}>38 ✅`,
-      indicators: { price, ema9, ema21, ema50, rsi },
+      reason: `HERMES SHORT — bear stack ✅, trend vote ${bearVotes}/${VOTE_BARS} ✅, RSI spiked>55 ✅, crossed below 52 ✅, RSI=${rsi.toFixed(1)}>38 ✅`,
+      indicators: { price, ema9, ema21, ema50, rsi, bearVotes },
     };
   }
 
   return {
     signal: null,
-    reason: `bear stack ✅ — waiting: RSI=${rsi.toFixed(1)} spike=${recentlyAbove55} cross52=${crossesBelow52} floor=${notOversold}`,
+    reason: `bear stack ✅ trend ${bearVotes}/${VOTE_BARS} ✅ — waiting: RSI=${rsi.toFixed(1)} spike=${recentlyAbove55} cross52=${crossesBelow52} floor=${notOversold}`,
     indicators: { price, ema9, ema21, ema50, rsi },
   };
 }
@@ -382,7 +407,7 @@ async function processAsset(asset, log) {
 
   // Run the assigned strategy
   const result = isHermes
-    ? checkStratHermes(candles)
+    ? checkStratHermes(candles, asset.trendVote || 0)
     : checkStratVwapRsi(candles);
 
   const ind = result.indicators || {};
@@ -429,7 +454,7 @@ async function processAsset(asset, log) {
 // ─── Dual-scan: run Hermes(1H) on VWAP assets (NEAR + SOL) ──────────────────
 async function processHermesDualScan(asset, log) {
   const candles = await fetchCandles(asset.okx, CONFIG.hermesTimeframe, 100);
-  const result  = checkStratHermes(candles);
+  const result  = checkStratHermes(candles, asset.trendVote || 0);
   if (!result.signal) {
     console.log(`  ⏸  ${asset.symbol} Hermes(${CONFIG.hermesTimeframe}) dual: ${result.reason}`);
     return false;
