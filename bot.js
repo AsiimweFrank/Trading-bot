@@ -695,6 +695,38 @@ async function run() {
     return;
   }
 
+  // ── Step 0: BTC RSI regime check ─────────────────────────────────────────
+  // When BTC RSI > 75, the whole market is in extreme overbought territory.
+  // Any asset in a bear stack is now "loaded" — rollover could fire next bar.
+  // This is a pre-signal warning, not a trade gate.
+  try {
+    const btcCandles = await fetchCandles("BTC-USDT", CONFIG.hermesTimeframe, 60);
+    const btcCloses  = btcCandles.map(c => c.close);
+    const btcRsi     = calcRSI(btcCloses, 14);
+    if (btcRsi >= 75) {
+      console.log(`\n  ⚡ BTC RSI EXTREME: ${btcRsi.toFixed(1)} — market-wide overbought.`);
+      console.log(`     Any asset in bear stack is pre-loaded for Hermes short.`);
+      // Check which watchlist assets are in bear stack right now
+      for (const asset of WATCHLIST) {
+        if (!asset.hermesAlso && asset.strategy !== "hermes_v03") continue;
+        try {
+          const ac = await fetchCandles(asset.okx, CONFIG.hermesTimeframe, 60);
+          const cl = ac.map(c => c.close);
+          const e9  = calcEMA(cl, 9), e21 = calcEMA(cl, 21), e50 = calcEMA(cl, 50);
+          const p   = cl[cl.length - 1];
+          const rsi = calcRSI(cl, 14);
+          if (e9 && e21 && e50 && e9 < e21 && e21 < e50 && p < e50) {
+            console.log(`     🎯 ${asset.symbol} bear stack ACTIVE — RSI ${rsi?.toFixed(1)} — watching for rollover`);
+          }
+        } catch (_) {}
+      }
+    } else {
+      console.log(`\n  📊 BTC RSI: ${btcRsi?.toFixed(1)} — market neutral/bearish, Hermes conditions normal`);
+    }
+  } catch (e) {
+    console.log(`  ⚠️  BTC regime check failed: ${e.message}`);
+  }
+
   // ── Step 1a: Check open Hermes positions (perpetual TP/SL exits) ─────────
   await checkHermesPositions(log);
 
