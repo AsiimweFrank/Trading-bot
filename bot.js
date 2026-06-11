@@ -236,18 +236,26 @@ function checkStratHermes(candles, trendVoteMin = 0) {
   const crossesBelow52  = rsiPrev >= 52 && rsi < 52;
   const notOversold     = rsi > 38;
 
-  if (recentlyAbove55 && crossesBelow52 && notOversold) {
+  // ── RSI slope filter: must drop ≥1.5 pts across last 2 bars ─────────────
+  // Filters weak slow rollovers that often recover before hitting TP
+  // NEAR today: RSI dropped 58.6→51.86 (-6.7) = strong ✅
+  // A slow drift of -0.3/bar = weak = likely to recover = skip
+  const rsiPrev2 = calcRSI(closes.slice(0, -2), 14);
+  const rsiSlope = rsiPrev2 ? (rsiPrev2 - rsi) : 0; // positive = falling
+  const strongRollover = rsiSlope >= 1.5;
+
+  if (recentlyAbove55 && crossesBelow52 && notOversold && strongRollover) {
     return {
       signal: "sell", side: "sell",
-      reason: `HERMES SHORT — bear stack ✅, trend vote ${bearVotes}/${VOTE_BARS} ✅, RSI spiked>55 ✅, crossed below 52 ✅, RSI=${rsi.toFixed(1)}>38 ✅`,
-      indicators: { price, ema9, ema21, ema50, rsi, bearVotes },
+      reason: `HERMES SHORT — bear stack ✅, trend vote ${bearVotes}/${VOTE_BARS} ✅, RSI spiked>55 ✅, crossed below 52 ✅, slope -${rsiSlope.toFixed(1)} ✅, RSI=${rsi.toFixed(1)}>38 ✅`,
+      indicators: { price, ema9, ema21, ema50, rsi, rsiSlope, bearVotes },
     };
   }
 
   return {
     signal: null,
-    reason: `bear stack ✅ trend ${bearVotes}/${VOTE_BARS} ✅ — waiting: RSI=${rsi.toFixed(1)} spike=${recentlyAbove55} cross52=${crossesBelow52} floor=${notOversold}`,
-    indicators: { price, ema9, ema21, ema50, rsi },
+    reason: `bear stack ✅ trend ${bearVotes}/${VOTE_BARS} ✅ — waiting: RSI=${rsi.toFixed(1)} spike=${recentlyAbove55} cross52=${crossesBelow52} slope=${rsiSlope.toFixed(1)}(need≥1.5) floor=${notOversold}`,
+    indicators: { price, ema9, ema21, ema50, rsi, rsiSlope },
   };
 }
 
@@ -258,16 +266,34 @@ function signBybit(timestamp, body) {
     .update(`${timestamp}5000${body}`).digest("hex");
 }
 
-async function placeBybitOrder(symbol, side, sizeUSD, price) {
-  const quantity  = (sizeUSD / price).toFixed(6);
+async function placeBybitOrder(symbol, side, sizeUSD, price, mode = "spot") {
   const timestamp = Date.now().toString();
-  const body = JSON.stringify({
-    category:  "spot",
-    symbol,
-    side:      side === "buy" ? "Buy" : "Sell",
-    orderType: "Market",
-    qty:       quantity,
-  });
+
+  let body;
+  if (mode === "linear") {
+    // Perpetual futures — true shorts possible, qty in contracts (USD value / price)
+    const qty = (sizeUSD / price).toFixed(3);
+    body = JSON.stringify({
+      category:    "linear",
+      symbol,
+      side:        side === "buy" ? "Buy" : "Sell",
+      orderType:   "Market",
+      qty,
+      timeInForce: "IOC",
+      reduceOnly:  false,
+      positionIdx: 0,   // one-way mode
+    });
+  } else {
+    // Spot — buy/sell tokens
+    const quantity = (sizeUSD / price).toFixed(6);
+    body = JSON.stringify({
+      category:  "spot",
+      symbol,
+      side:      side === "buy" ? "Buy" : "Sell",
+      orderType: "Market",
+      qty:       quantity,
+    });
+  }
   const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/create`, {
     method: "POST",
     headers: {
@@ -371,7 +397,7 @@ async function checkHermesPositions(log) {
         : (pos.entry - activeSL) / pos.entry * pos.size;
       console.log(`  🛑 SL HIT @ $${price.toFixed(4)} | PnL: $${pnl.toFixed(2)}`);
       if (!CONFIG.paperTrading) {
-        try { await placeBybitOrder(pos.symbol, "buy", pos.tp1Hit ? pos.size*0.5 : pos.size, price); } catch {}
+        try { await placeBybitOrder(pos.symbol, "buy", pos.tp1Hit ? pos.size*0.5 : pos.size, price, "linear"); } catch {}
       }
       writeTradeCsv({ symbol: pos.symbol, strategy: "hermes_v03", side: "buy", price, tradeSize: pos.tp1Hit ? pos.size*0.5 : pos.size, mode: CONFIG.paperTrading?"PAPER":"LIVE", signal: `EXIT_SL pnl=$${pnl.toFixed(2)}` });
       pos.status = "closed"; pos.closeReason = "stop_loss"; pos.closePrice = price; pos.closeTime = new Date().toISOString(); pos.pnl = pnl;
@@ -382,7 +408,7 @@ async function checkHermesPositions(log) {
       const pnl1 = (pos.entry - pos.tp1) / pos.entry * (pos.size * 0.5);
       console.log(`  🎯 TP1 HIT @ $${price.toFixed(4)} — exiting 50% | Locked: +$${pnl1.toFixed(2)} | SL→ breakeven`);
       if (!CONFIG.paperTrading) {
-        try { await placeBybitOrder(pos.symbol, "buy", pos.size * 0.5, price); } catch {}
+        try { await placeBybitOrder(pos.symbol, "buy", pos.size * 0.5, price, "linear"); } catch {}
       }
       writeTradeCsv({ symbol: pos.symbol, strategy: "hermes_v03", side: "buy", price, tradeSize: pos.size*0.5, mode: CONFIG.paperTrading?"PAPER":"LIVE", signal: `EXIT_TP1 locked=+$${pnl1.toFixed(2)}` });
       pos.tp1Hit = true;
@@ -395,7 +421,7 @@ async function checkHermesPositions(log) {
       const pnl1 = (pos.entry - pos.tp1) / pos.entry * (pos.size * 0.5);
       console.log(`  🏆 TP2 HIT @ $${price.toFixed(4)} — full exit | Total PnL: +$${(pnl1+pnl2).toFixed(2)}`);
       if (!CONFIG.paperTrading) {
-        try { await placeBybitOrder(pos.symbol, "buy", pos.size * 0.5, price); } catch {}
+        try { await placeBybitOrder(pos.symbol, "buy", pos.size * 0.5, price, "linear"); } catch {}
       }
       writeTradeCsv({ symbol: pos.symbol, strategy: "hermes_v03", side: "buy", price, tradeSize: pos.size*0.5, mode: CONFIG.paperTrading?"PAPER":"LIVE", signal: `EXIT_TP2 total=+$${(pnl1+pnl2).toFixed(2)}` });
       pos.status = "closed"; pos.closeReason = "take_profit_full"; pos.closePrice = price; pos.closeTime = new Date().toISOString(); pos.pnl = pnl1+pnl2;
@@ -450,15 +476,14 @@ async function processAsset(asset, log) {
   }
 
   // Live execution
+  // Hermes = perpetual (true short), VWAP = spot (token buy/sell)
+  const execMode = isHermes ? "linear" : "spot";
   try {
-    const order = await placeBybitOrder(asset.symbol, result.side, tradeSize, price);
-    console.log(`  ✅ ORDER PLACED: ${result.side.toUpperCase()} ${asset.symbol} | ID: ${order.orderId}`);
-    writeTradeCsv({ symbol: asset.symbol, strategy: asset.strategy, side: result.side, price, tradeSize, orderId: order.orderId, mode: "LIVE", signal: result.reason });
-    log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: result.side, price, orderPlaced: true, orderId: order.orderId });
-    // Track Hermes positions for partial TP management
-    if (asset.strategy === "hermes_v03" || asset.hermesAlso) {
-      openHermesPosition(asset.symbol, price, tradeSize, order.orderId);
-    }
+    const order = await placeBybitOrder(asset.symbol, result.side, tradeSize, price, execMode);
+    console.log(`  ✅ ORDER PLACED: ${result.side.toUpperCase()} ${asset.symbol} [${execMode}] | ID: ${order.orderId}`);
+    writeTradeCsv({ symbol: asset.symbol, strategy: asset.strategy, side: result.side, price, tradeSize, orderId: order.orderId, mode: `LIVE-${execMode.toUpperCase()}`, signal: result.reason });
+    log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: result.side, price, orderPlaced: true, orderId: order.orderId, execMode });
+    if (isHermes) openHermesPosition(asset.symbol, price, tradeSize, order.orderId);
     return true;
   } catch (err) {
     console.log(`  ❌ Order failed: ${err.message}`);
@@ -483,9 +508,9 @@ async function processHermesDualScan(asset, log) {
     return true;
   }
   try {
-    const order = await placeBybitOrder(asset.symbol, result.side, tradeSize, price);
-    writeTradeCsv({ symbol: asset.symbol, strategy: "hermes_v04", side: result.side, price, tradeSize, orderId: order.orderId, mode: "LIVE", signal: result.reason });
-    log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: result.side, price, orderPlaced: true, orderId: order.orderId });
+    const order = await placeBybitOrder(asset.symbol, result.side, tradeSize, price, "linear");
+    writeTradeCsv({ symbol: asset.symbol, strategy: "hermes_v05", side: result.side, price, tradeSize, orderId: order.orderId, mode: "LIVE-LINEAR", signal: result.reason });
+    log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: result.side, price, orderPlaced: true, orderId: order.orderId, execMode: "linear" });
     openHermesPosition(asset.symbol, price, tradeSize, order.orderId);
     return true;
   } catch (err) {
