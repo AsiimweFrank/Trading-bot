@@ -39,7 +39,82 @@ const CONFIG = {
     secretKey: process.env.BYBIT_SECRET_KEY,
     baseUrl:   process.env.BYBIT_BASE_URL || "https://api.bybit.com",
   },
+  telegram: {
+    token:  process.env.TELEGRAM_TOKEN   || "8705134965:AAHrzaLoWxN1reDrc1BqiFzS-XC4aD-E2gU",
+    chatId: process.env.TELEGRAM_CHAT_ID || "5226302822",
+  },
 };
+
+// ─── Telegram Alerts ──────────────────────────────────────────────────────────
+
+async function tg(message) {
+  try {
+    const url  = `https://api.telegram.org/bot${CONFIG.telegram.token}/sendMessage`;
+    const body = JSON.stringify({ chat_id: CONFIG.telegram.chatId, text: message, parse_mode: "HTML" });
+    const res  = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body });
+    if (!res.ok) console.log(`  ⚠️  Telegram send failed: ${res.status}`);
+  } catch (e) {
+    console.log(`  ⚠️  Telegram error: ${e.message}`);
+  }
+}
+
+function tgEntry(symbol, side, price, tradeSize, tp1, tp2, sl, strategy) {
+  const emoji = side === "sell" ? "🔴" : "🟢";
+  const dir   = side === "sell" ? "SHORT" : "LONG";
+  return tg(
+`${emoji} <b>NEW ${dir} — ${symbol}</b>
+📍 Entry:  <b>$${price}</b>
+🎯 TP1:    $${tp1} (+1.5%)
+🏆 TP2:    $${tp2} (+3.0%)
+🛑 SL:     $${sl} (-1.5%)
+💰 Size:   $${tradeSize}
+📊 Strat:  ${strategy}
+🕐 ${new Date().toUTCString()}`
+  );
+}
+
+function tgTP1(symbol, entry, tp1Price, pnl) {
+  return tg(
+`✅ <b>TP1 HIT — ${symbol}</b>
+📍 Entry:   $${entry}
+✅ TP1 hit: $${tp1Price}
+💵 Profit:  +$${pnl.toFixed(2)} (50% closed)
+🔒 SL moved to breakeven
+⏳ Holding 50% for TP2...`
+  );
+}
+
+function tgTP2(symbol, entry, tp2Price, pnl) {
+  return tg(
+`🏆 <b>TP2 HIT — ${symbol}</b>
+📍 Entry:   $${entry}
+🏆 TP2 hit: $${tp2Price}
+💵 Profit:  +$${pnl.toFixed(2)} (full trade closed)
+✅ Trade complete!`
+  );
+}
+
+function tgSL(symbol, entry, slPrice, pnl, afterTP1 = false) {
+  const tag = afterTP1 ? "SL @ BREAKEVEN" : "STOP LOSS HIT";
+  const net  = afterTP1 ? "(TP1 profit locked ✅)" : "";
+  return tg(
+`🛑 <b>${tag} — ${symbol}</b>
+📍 Entry: $${entry}
+🛑 Exit:  $${slPrice}
+💵 P&L:   $${pnl.toFixed(2)} ${net}`
+  );
+}
+
+function tgRegimeAlert(btcRsi, loadedAssets) {
+  if (!loadedAssets.length) return Promise.resolve();
+  return tg(
+`⚡ <b>BTC RSI EXTREME: ${btcRsi.toFixed(1)}</b>
+Market is overbought — reversal incoming.
+Bear stack assets ready to SHORT:
+${loadedAssets.map(a => `• ${a}`).join("\n")}
+🎯 Hermes entry may fire next bar!`
+  );
+}
 
 // Resolve trade size: % of portfolio if TRADE_SIZE_PCT set, else fixed USD
 function getTradeSize() {
@@ -438,7 +513,7 @@ async function checkHermesPositions(log) {
     // ── SL Hit ──────────────────────────────────────────────────────────────
     if (price >= activeSL) {
       const pnl = pos.tp1Hit
-        ? (pos.entry - activeSL) / pos.entry * (pos.size * 0.5)   // only 50% left
+        ? (pos.entry - activeSL) / pos.entry * (pos.size * 0.5)
         : (pos.entry - activeSL) / pos.entry * pos.size;
       console.log(`  🛑 SL HIT @ $${price.toFixed(4)} | PnL: $${pnl.toFixed(2)}`);
       if (!CONFIG.paperTrading) {
@@ -447,18 +522,20 @@ async function checkHermesPositions(log) {
       writeTradeCsv({ symbol: pos.symbol, strategy: "hermes_v03", side: "buy", price, tradeSize: pos.tp1Hit ? pos.size*0.5 : pos.size, mode: CONFIG.paperTrading?"PAPER":"LIVE", signal: `EXIT_SL pnl=$${pnl.toFixed(2)}` });
       pos.status = "closed"; pos.closeReason = "stop_loss"; pos.closePrice = price; pos.closeTime = new Date().toISOString(); pos.pnl = pnl;
       log.trades.push({ timestamp: new Date().toISOString(), symbol: pos.symbol, side: "buy", price, orderPlaced: true, reason: "hermes_sl" });
+      await tgSL(pos.symbol, pos.entry, price.toFixed(4), pnl, pos.tp1Hit);
 
     // ── TP1 Hit (partial exit 50%) ───────────────────────────────────────────
     } else if (!pos.tp1Hit && price <= pos.tp1) {
       const pnl1 = (pos.entry - pos.tp1) / pos.entry * (pos.size * 0.5);
-      console.log(`  🎯 TP1 HIT @ $${price.toFixed(4)} — exiting 50% | Locked: +$${pnl1.toFixed(2)} | SL→ breakeven`);
+      console.log(`  ✅ TP1 HIT @ $${price.toFixed(4)} — exiting 50% | Locked: +$${pnl1.toFixed(2)} | SL→ breakeven`);
       if (!CONFIG.paperTrading) {
         try { await placeBybitOrder(pos.symbol, "buy", pos.size * 0.5, price, "linear"); } catch {}
       }
       writeTradeCsv({ symbol: pos.symbol, strategy: "hermes_v03", side: "buy", price, tradeSize: pos.size*0.5, mode: CONFIG.paperTrading?"PAPER":"LIVE", signal: `EXIT_TP1 locked=+$${pnl1.toFixed(2)}` });
       pos.tp1Hit = true;
-      pos.slBE   = +(pos.entry * 1.001).toFixed(6); // SL to entry+0.1% (breakeven)
+      pos.slBE   = +(pos.entry * 1.001).toFixed(6);
       log.trades.push({ timestamp: new Date().toISOString(), symbol: pos.symbol, side: "buy", price, orderPlaced: true, reason: "hermes_tp1" });
+      await tgTP1(pos.symbol, pos.entry, price.toFixed(4), pnl1);
 
     // ── TP2 Hit (full exit remaining 50%) ────────────────────────────────────
     } else if (pos.tp1Hit && price <= pos.tp2) {
@@ -471,6 +548,7 @@ async function checkHermesPositions(log) {
       writeTradeCsv({ symbol: pos.symbol, strategy: "hermes_v03", side: "buy", price, tradeSize: pos.size*0.5, mode: CONFIG.paperTrading?"PAPER":"LIVE", signal: `EXIT_TP2 total=+$${(pnl1+pnl2).toFixed(2)}` });
       pos.status = "closed"; pos.closeReason = "take_profit_full"; pos.closePrice = price; pos.closeTime = new Date().toISOString(); pos.pnl = pnl1+pnl2;
       log.trades.push({ timestamp: new Date().toISOString(), symbol: pos.symbol, side: "buy", price, orderPlaced: true, reason: "hermes_tp2" });
+      await tgTP2(pos.symbol, pos.entry, price.toFixed(4), pnl1+pnl2);
     }
   }
 
@@ -525,8 +603,11 @@ async function processAsset(asset, log) {
     console.log(`  📋 PAPER: Would ${result.side.toUpperCase()} $${tradeSize} of ${asset.symbol} @ $${price.toFixed(4)}`);
     writeTradeCsv({ symbol: asset.symbol, strategy: asset.strategy, side: result.side, price, tradeSize, mode: "PAPER", signal: result.reason });
     log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: result.side, price, orderPlaced: true, paper: true });
-    // Track paper positions too so conflict guard works in paper mode
     openPositionRecord(asset.symbol, result.side, price, tradeSize, asset.strategy, null);
+    if (isHermes) {
+      const tp1 = (price * 0.985).toFixed(4), tp2 = (price * 0.970).toFixed(4), sl = (price * 1.015).toFixed(4);
+      await tgEntry(asset.symbol, result.side, price.toFixed(4), tradeSize, tp1, tp2, sl, "Hermes v05 [PAPER]");
+    }
     return true;
   }
 
@@ -538,6 +619,10 @@ async function processAsset(asset, log) {
     writeTradeCsv({ symbol: asset.symbol, strategy: asset.strategy, side: result.side, price, tradeSize, orderId: order.orderId, mode: `LIVE-${execMode.toUpperCase()}`, signal: result.reason });
     log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: result.side, price, orderPlaced: true, orderId: order.orderId, execMode });
     openPositionRecord(asset.symbol, result.side, price, tradeSize, asset.strategy, order.orderId);
+    if (isHermes) {
+      const tp1 = (price * 0.985).toFixed(4), tp2 = (price * 0.970).toFixed(4), sl = (price * 1.015).toFixed(4);
+      await tgEntry(asset.symbol, result.side, price.toFixed(4), tradeSize, tp1, tp2, sl, "Hermes v05 [LIVE]");
+    }
     return true;
   } catch (err) {
     console.log(`  ❌ Order failed: ${err.message}`);
@@ -563,9 +648,12 @@ async function processHermesDualScan(asset, log) {
   }
 
   console.log(`  🎯 ${asset.symbol} HERMES(${CONFIG.hermesTimeframe}) SIGNAL: ${result.side.toUpperCase()} — ${result.reason}`);
+  const tp1str = (price * 0.985).toFixed(4), tp2str = (price * 0.970).toFixed(4), slStr = (price * 1.015).toFixed(4);
   if (CONFIG.paperTrading) {
     writeTradeCsv({ symbol: asset.symbol, strategy: "hermes_v04", side: result.side, price, tradeSize, mode: "PAPER", signal: result.reason });
     log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: result.side, price, orderPlaced: true, paper: true });
+    openHermesPosition(asset.symbol, price, tradeSize, null);
+    await tgEntry(asset.symbol, result.side, price.toFixed(4), tradeSize, tp1str, tp2str, slStr, "Hermes v05 [PAPER]");
     return true;
   }
   try {
@@ -573,6 +661,7 @@ async function processHermesDualScan(asset, log) {
     writeTradeCsv({ symbol: asset.symbol, strategy: "hermes_v05", side: result.side, price, tradeSize, orderId: order.orderId, mode: "LIVE-LINEAR", signal: result.reason });
     log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: result.side, price, orderPlaced: true, orderId: order.orderId, execMode: "linear" });
     openHermesPosition(asset.symbol, price, tradeSize, order.orderId);
+    await tgEntry(asset.symbol, result.side, price.toFixed(4), tradeSize, tp1str, tp2str, slStr, "Hermes v05 [LIVE]");
     return true;
   } catch (err) {
     console.log(`  ❌ ${asset.symbol} Hermes order failed: ${err.message}`);
@@ -706,7 +795,7 @@ async function run() {
     if (btcRsi >= 75) {
       console.log(`\n  ⚡ BTC RSI EXTREME: ${btcRsi.toFixed(1)} — market-wide overbought.`);
       console.log(`     Any asset in bear stack is pre-loaded for Hermes short.`);
-      // Check which watchlist assets are in bear stack right now
+      const loadedAssets = [];
       for (const asset of WATCHLIST) {
         if (!asset.hermesAlso && asset.strategy !== "hermes_v03") continue;
         try {
@@ -717,9 +806,11 @@ async function run() {
           const rsi = calcRSI(cl, 14);
           if (e9 && e21 && e50 && e9 < e21 && e21 < e50 && p < e50) {
             console.log(`     🎯 ${asset.symbol} bear stack ACTIVE — RSI ${rsi?.toFixed(1)} — watching for rollover`);
+            loadedAssets.push(`${asset.symbol} (RSI ${rsi?.toFixed(1)})`);
           }
         } catch (_) {}
       }
+      if (loadedAssets.length) await tgRegimeAlert(btcRsi, loadedAssets);
     } else {
       console.log(`\n  📊 BTC RSI: ${btcRsi?.toFixed(1)} — market neutral/bearish, Hermes conditions normal`);
     }
