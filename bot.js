@@ -137,9 +137,15 @@ const WATCHLIST = [
   { symbol: "BTCUSDT",  okx: "BTC-USDT",  strategy: "vwap_rsi3_ema8",                     trendVote: 12 },
 ];
 
-const LOG_FILE      = "safety-check-log.json";
-const CSV_FILE      = "trades.csv";
-const POSITION_FILE = "positions.json";
+// ── Persistent data directory ─────────────────────────────────────────────────
+// On Railway: mount a Volume at /data so files survive deploys.
+// Locally: files land in the project folder (DATA_DIR = "").
+// Set DATA_DIR=/data in Railway environment variables (done automatically
+// when you add a Volume mounted at /data in the Railway dashboard).
+const DATA_DIR      = process.env.DATA_DIR ? process.env.DATA_DIR.replace(/\/$/, "") : "";
+const LOG_FILE      = `${DATA_DIR ? DATA_DIR + "/" : ""}safety-check-log.json`;
+const CSV_FILE      = `${DATA_DIR ? DATA_DIR + "/" : ""}trades.csv`;
+const POSITION_FILE = `${DATA_DIR ? DATA_DIR + "/" : ""}positions.json`;
 
 // ─── Logging ──────────────────────────────────────────────────────────────────
 
