@@ -132,7 +132,7 @@ function getTradeSize() {
 // vwapTimeframe = override VWAP candle TF per asset (default = CONFIG.timeframe = 5m)
 //   ETH VWAP backtest: 5m → 39% WR -$9.93 ❌ | 1H → 100% WR +$0.02 ✅ → use 1H
 const WATCHLIST = [
-  { symbol: "NEARUSDT", okx: "NEAR-USDT", strategy: "vwap_rsi3_ema8", hermesAlso: true,  trendVote: 0,  vwapTimeframe: "5m" },
+  { symbol: "NEARUSDT", okx: "NEAR-USDT", strategy: "vwap_rsi3_ema8", hermesAlso: true,  trendVote: 0,  vwapTimeframe: "15m" },
   { symbol: "SOLUSDT",  okx: "SOL-USDT",  strategy: "vwap_rsi3_ema8", hermesAlso: true,  trendVote: 0,  vwapTimeframe: "5m" },
   { symbol: "ETHUSDT",  okx: "ETH-USDT",  strategy: "vwap_rsi3_ema8", hermesAlso: true,  trendVote: 0,  vwapTimeframe: "1H" },
   { symbol: "BTCUSDT",  okx: "BTC-USDT",  strategy: "vwap_rsi3_ema8",                    trendVote: 12, vwapTimeframe: "5m" },
@@ -320,19 +320,12 @@ function checkStratHermes(candles, trendVoteMin = 0) {
   const crossesBelow52  = rsiPrev >= 52 && rsi < 52;
   const notOversold     = rsi > 38;
 
-  // ── RSI slope filter: must drop ≥1.5 pts across last 2 bars ─────────────
-  // Filters weak slow rollovers that often recover before hitting TP
-  // NEAR today: RSI dropped 58.6→51.86 (-6.7) = strong ✅
-  // A slow drift of -0.3/bar = weak = likely to recover = skip
-  const rsiPrev2 = calcRSI(closes.slice(0, -2), 14);
-  const rsiSlope = rsiPrev2 ? (rsiPrev2 - rsi) : 0; // positive = falling
-  const strongRollover = rsiSlope >= 1.5;
-
   // ── Volume spike confirmation: PREVIOUS completed bar > 1.2× 20-bar average
   // IMPORTANT: use index -2 (last CLOSED bar), not -1 (current forming bar).
   // The current 1H bar is always partial — its volume starts near zero and builds.
-  // Checking it would block every signal early in the hour regardless of real volume.
-  // The previous closed bar gives the true volume reading for the RSI rollover bar.
+  // NOTE: RSI slope filter was REMOVED — backtest showed it kills all signals and
+  // on ETH actually selected only losers (7 trades, 0% WR, -$5.25). Volume alone
+  // is sufficient confirmation without over-filtering.
   const volumes  = candles.map((c) => c.volume);
   const prevVol  = volumes[volumes.length - 2]; // last COMPLETED bar
   const vol20    = volumes.slice(-22, -2);       // 20 bars before that
@@ -340,18 +333,18 @@ function checkStratHermes(candles, trendVoteMin = 0) {
   const volRatio      = avgVol > 0 ? prevVol / avgVol : 1;
   const volumeConfirm = volRatio >= 1.2;
 
-  if (recentlyAbove55 && crossesBelow52 && notOversold && strongRollover && volumeConfirm) {
+  if (recentlyAbove55 && crossesBelow52 && notOversold && volumeConfirm) {
     return {
       signal: "sell", side: "sell",
-      reason: `HERMES SHORT — bear stack ✅, trend vote ${bearVotes}/${VOTE_BARS} ✅, RSI spiked>55 ✅, crossed below 52 ✅, slope -${rsiSlope.toFixed(1)} ✅, RSI=${rsi.toFixed(1)}>38 ✅, vol ${volRatio.toFixed(2)}×avg ✅`,
-      indicators: { price, ema9, ema21, ema50, rsi, rsiSlope, bearVotes, volRatio },
+      reason: `HERMES SHORT — bear stack ✅, trend vote ${bearVotes}/${VOTE_BARS} ✅, RSI spiked>55 ✅, crossed below 52 ✅, RSI=${rsi.toFixed(1)}>38 ✅, vol ${volRatio.toFixed(2)}×avg ✅`,
+      indicators: { price, ema9, ema21, ema50, rsi, bearVotes, volRatio },
     };
   }
 
   return {
     signal: null,
-    reason: `bear stack ✅ trend ${bearVotes}/${VOTE_BARS} ✅ — waiting: RSI=${rsi.toFixed(1)} spike=${recentlyAbove55} cross52=${crossesBelow52} slope=${rsiSlope.toFixed(1)}(need≥1.5) floor=${notOversold} vol=${volRatio.toFixed(2)}×(need≥1.2)`,
-    indicators: { price, ema9, ema21, ema50, rsi, rsiSlope, volRatio },
+    reason: `bear stack ✅ trend ${bearVotes}/${VOTE_BARS} ✅ — waiting: RSI=${rsi.toFixed(1)} spike=${recentlyAbove55} cross52=${crossesBelow52} floor=${notOversold} vol=${volRatio.toFixed(2)}×(need≥1.2)`,
+    indicators: { price, ema9, ema21, ema50, rsi, volRatio },
   };
 }
 
