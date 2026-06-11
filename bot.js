@@ -1,11 +1,11 @@
 /**
  * Claude Trading Bot — Multi-Asset, Dual Strategy
  *
- * Watchlist & strategy assignment (from backtest results):
- *   NEAR  → VWAP + RSI(3) + EMA(8)   [79.3% WR]  + Hermes scan
- *   SOL   → VWAP + RSI(3) + EMA(8)   [75.1% WR]
- *   BTC   → Hermes v03 (RSI Rejection)[84.4% WR]
- *   ETH   → Hermes v03 (RSI Rejection)[100% WR]
+ * Watchlist & strategy assignment (backtest v04 — 5m 30d):
+ *   NEAR  → VWAP primary + Hermes dual [Hermes 95.5% WR ← best asset]
+ *   SOL   → VWAP primary + Hermes dual [Hermes 83.1% WR, 59 trades]
+ *   ETH   → Hermes v04               [85.7% WR]
+ *   BTC   → VWAP + RSI(3) + EMA(8)   [Hermes WR dropped to 43.9% — paused]
  *
  * Improvements (v04):
  *   - Hermes positions tracked in positions.json
@@ -35,13 +35,14 @@ const CONFIG = {
   },
 };
 
-// Watchlist — strategy assigned per asset from backtest results
-// NEAR runs VWAP primary + Hermes secondary (live signal confirmed 2026-06-11)
+// Watchlist — updated from backtest_hermes_v04 results (2026-06-11)
+// BTC Hermes WR fell to 43.9% in recent 30d → switched to VWAP
+// SOL added to Hermes dual-scan (83.1% WR, most signals of any asset)
 const WATCHLIST = [
-  { symbol: "NEARUSDT", okx: "NEAR-USDT", strategy: "vwap_rsi3_ema8", hermesAlso: true },
-  { symbol: "SOLUSDT",  okx: "SOL-USDT",  strategy: "vwap_rsi3_ema8" },
-  { symbol: "BTCUSDT",  okx: "BTC-USDT",  strategy: "hermes_v03"     },
-  { symbol: "ETHUSDT",  okx: "ETH-USDT",  strategy: "hermes_v03"     },
+  { symbol: "NEARUSDT", okx: "NEAR-USDT", strategy: "vwap_rsi3_ema8", hermesAlso: true  },
+  { symbol: "SOLUSDT",  okx: "SOL-USDT",  strategy: "vwap_rsi3_ema8", hermesAlso: true  },
+  { symbol: "ETHUSDT",  okx: "ETH-USDT",  strategy: "hermes_v03"                        },
+  { symbol: "BTCUSDT",  okx: "BTC-USDT",  strategy: "vwap_rsi3_ema8"                    },
 ];
 
 const LOG_FILE      = "safety-check-log.json";
@@ -418,30 +419,30 @@ async function processAsset(asset, log) {
   }
 }
 
-// ─── NEAR dual-scan: run Hermes on NEAR in addition to primary VWAP strategy ──
-async function processNearHermes(log) {
-  const candles = await fetchCandles("NEAR-USDT", CONFIG.timeframe, 200);
+// ─── Dual-scan: run Hermes on VWAP assets (NEAR + SOL) ───────────────────────
+async function processHermesDualScan(asset, log) {
+  const candles = await fetchCandles(asset.okx, CONFIG.timeframe, 200);
   const result  = checkStratHermes(candles);
   if (!result.signal) {
-    console.log(`  ⏸  NEAR Hermes: ${result.reason}`);
+    console.log(`  ⏸  ${asset.symbol} Hermes dual: ${result.reason}`);
     return false;
   }
   const price     = candles[candles.length - 1].close;
   const tradeSize = CONFIG.maxTradeSizeUSD;
-  console.log(`  🎯 NEAR HERMES SIGNAL: ${result.side.toUpperCase()} — ${result.reason}`);
+  console.log(`  🎯 ${asset.symbol} HERMES SIGNAL: ${result.side.toUpperCase()} — ${result.reason}`);
   if (CONFIG.paperTrading) {
-    writeTradeCsv({ symbol: "NEARUSDT", strategy: "hermes_v03", side: result.side, price, tradeSize, mode: "PAPER", signal: result.reason });
-    log.trades.push({ timestamp: new Date().toISOString(), symbol: "NEARUSDT", side: result.side, price, orderPlaced: true, paper: true });
+    writeTradeCsv({ symbol: asset.symbol, strategy: "hermes_v04", side: result.side, price, tradeSize, mode: "PAPER", signal: result.reason });
+    log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: result.side, price, orderPlaced: true, paper: true });
     return true;
   }
   try {
-    const order = await placeBybitOrder("NEARUSDT", result.side, tradeSize, price);
-    writeTradeCsv({ symbol: "NEARUSDT", strategy: "hermes_v03", side: result.side, price, tradeSize, orderId: order.orderId, mode: "LIVE", signal: result.reason });
-    log.trades.push({ timestamp: new Date().toISOString(), symbol: "NEARUSDT", side: result.side, price, orderPlaced: true, orderId: order.orderId });
-    openHermesPosition("NEARUSDT", price, tradeSize, order.orderId);
+    const order = await placeBybitOrder(asset.symbol, result.side, tradeSize, price);
+    writeTradeCsv({ symbol: asset.symbol, strategy: "hermes_v04", side: result.side, price, tradeSize, orderId: order.orderId, mode: "LIVE", signal: result.reason });
+    log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: result.side, price, orderPlaced: true, orderId: order.orderId });
+    openHermesPosition(asset.symbol, price, tradeSize, order.orderId);
     return true;
   } catch (err) {
-    console.log(`  ❌ NEAR Hermes order failed: ${err.message}`);
+    console.log(`  ❌ ${asset.symbol} Hermes order failed: ${err.message}`);
     return false;
   }
 }
@@ -486,9 +487,9 @@ async function run() {
     try {
       const traded = await processAsset(asset, log);
       if (traded) tradesThisRun++;
-      // NEAR: also run Hermes scan as secondary strategy
+      // NEAR/SOL: also run Hermes as secondary strategy when VWAP has no signal
       if (asset.hermesAlso && !traded && todayCount + tradesThisRun < CONFIG.maxTradesPerDay) {
-        const hermesTraded = await processNearHermes(log);
+        const hermesTraded = await processHermesDualScan(asset, log);
         if (hermesTraded) tradesThisRun++;
       }
     } catch (err) {

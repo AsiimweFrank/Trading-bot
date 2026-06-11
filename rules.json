@@ -1,50 +1,55 @@
 {
-  "watchlist": ["BTCUSDT"],
-  "default_timeframe": "1m",
+  "watchlist": ["NEARUSDT", "SOLUSDT", "BTCUSDT", "ETHUSDT"],
+  "default_timeframe": "5m",
+  "removed": ["ADAUSDT — both strategies failed backtest (0-22% WR)"],
 
-  "strategy": {
-    "name": "VWAP + RSI(3) + EMA(8) Scalping Strategy",
-    "sources": ["Lewis Jackson"],
-    "description": "Three indicators, each doing a different job. EMA(8) for trend direction, VWAP for session bias, RSI(3) for entry timing. All three must align before a trade fires."
+  "strategy_assignments": {
+    "NEARUSDT": "vwap_rsi3_ema8 + hermes_v04 dual",
+    "SOLUSDT":  "vwap_rsi3_ema8 + hermes_v04 dual",
+    "ETHUSDT":  "hermes_v04",
+    "BTCUSDT":  "vwap_rsi3_ema8 (Hermes paused — WR fell to 43.9%)"
   },
 
-  "indicators": {
-    "ema_8": "Trend direction. Price above EMA(8) = bullish momentum. Below = bearish.",
-    "vwap": "Session bias. Price above VWAP = buyers in control. Below = sellers. Resets at midnight UTC.",
-    "rsi_3": "Entry timing. RSI on 3 candles only — extremely sensitive. Below 30 in an uptrend = snap-back setup. Above 70 in a downtrend = reversal likely."
+  "backtest_results": {
+    "period": "30 days",
+    "timeframe": "5m",
+    "trade_size_usd": 50,
+    "run_date": "2026-06-11",
+    "NEARUSDT": { "strategy": "hermes_v04", "wr": "95.5%", "pnl": "$8.56",  "trades": 22,  "maxDD": "$0.75" },
+    "SOLUSDT":  { "strategy": "hermes_v04", "wr": "83.1%", "pnl": "$1.58",  "trades": 59,  "maxDD": "$0.62" },
+    "ETHUSDT":  { "strategy": "hermes_v04", "wr": "85.7%", "pnl": "$0.56",  "trades": 14,  "maxDD": "$0.07" },
+    "BTCUSDT":  { "strategy": "hermes_v04", "wr": "43.9%", "pnl": "-$0.06", "trades": 41,  "maxDD": "$0.56", "note": "Hermes paused — choppy regime" }
   },
 
-  "bias_criteria": {
-    "bullish": ["Price is above VWAP", "Price is above EMA(8)"],
-    "bearish": ["Price is below VWAP", "Price is below EMA(8)"]
+  "live_signals": {
+    "NEAR_short_2026-06-11": {
+      "entry": 2.055, "tp1": 2.024, "tp2": 1.993,
+      "outcome": "TP2 hit — bar low $1.991",
+      "pnl": "+$1.125 (+2.25%)"
+    }
   },
 
-  "entry_rules": {
-    "long": [
-      "Price is above VWAP — buyers in control for the session",
-      "Price is above EMA(8) — uptrend confirmed",
-      "RSI(3) has dropped below 30 — short-term pullback in an uptrend, snap-back likely"
-    ],
-    "short": [
-      "Price is below VWAP — sellers in control",
-      "Price is below EMA(8) — downtrend confirmed",
-      "RSI(3) has spiked above 70 — overbought in a downtrend, reversal likely"
-    ]
-  },
-
-  "exit_rules": [
-    "Exit when RSI(3) crosses back above 50 (for longs) or below 50 (for shorts)",
-    "Hard stop: 0.3% below entry for longs, 0.3% above entry for shorts",
-    "Take profit at next VWAP touch or EMA(8) cross"
-  ],
-
-  "risk_rules": [
-    "Risk maximum 1% of portfolio per trade",
-    "Maximum trade size capped by MAX_TRADE_SIZE_USD in .env",
-    "Maximum trades per day capped by MAX_TRADES_PER_DAY in .env",
-    "Do not trade if price is more than 1.5% away from VWAP — overextended",
-    "Paper trade first — validate this strategy on your specific asset before going live"
-  ],
-
-  "notes": "Scalping strategy — designed for 1m to 5m timeframes. RSI(3) is intentionally fast and sensitive. Do not apply to higher timeframes."
+  "strategies": {
+    "vwap_rsi3_ema8": {
+      "name": "VWAP + RSI(3) + EMA(8) Scalping",
+      "description": "Three indicators: EMA(8) for trend, VWAP for session bias, RSI(3) for timing.",
+      "long_entry":  ["price > VWAP", "price > EMA(8)", "RSI(3) < 30", "price within 1.5% of VWAP"],
+      "short_entry": ["price < VWAP", "price < EMA(8)", "RSI(3) > 70", "price within 1.5% of VWAP"],
+      "exit": ["RSI(3) crosses 50", "bias flips", "0.3% stop loss"]
+    },
+    "hermes_v03": {
+      "name": "Hermes v03 — RSI Rejection in Downtrend",
+      "description": "SHORT ONLY in bear stack. Catches dead-cat bounces when RSI spikes then rolls over.",
+      "short_entry": [
+        "EMA9 < EMA21 < EMA50 (bear stack)",
+        "price < EMA50",
+        "RSI(14) was above 55 in last 5 bars",
+        "RSI(14) crosses below 52",
+        "RSI(14) > 38 (not already oversold)"
+      ],
+      "stop_loss_pct": 1.5,
+      "take_profit_pct": 3.0,
+      "rr_ratio": "1:2"
+    }
+  }
 }
