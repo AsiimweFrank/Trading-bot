@@ -345,26 +345,48 @@ function savePositions(positions) {
   writeFileSync(POSITION_FILE, JSON.stringify(positions, null, 2));
 }
 
-function openHermesPosition(symbol, entry, tradeSize, orderId) {
+// Returns true if this asset already has an open position (any strategy)
+// Prevents VWAP buy firing while Hermes short is active on same asset, and vice versa
+function hasOpenPosition(symbol) {
   const positions = loadPositions();
-  // Remove any existing open position for this symbol
-  const filtered = positions.filter((p) => p.symbol !== symbol || p.status !== "open");
+  return positions.some((p) => p.symbol === symbol && p.status === "open");
+}
+
+// Universal position recorder — used by both Hermes and VWAP
+// Hermes shorts: full TP/SL tracking
+// VWAP trades: recorded so conflict guard blocks opposite signals on same asset
+function openPositionRecord(symbol, side, entry, tradeSize, strategy, orderId) {
+  const positions = loadPositions();
+  const filtered  = positions.filter((p) => p.symbol !== symbol || p.status !== "open");
+  const isHermesStrat = strategy === "hermes_v03" || strategy === "hermes_v04" || strategy === "hermes_v05";
+
   filtered.push({
     symbol,
-    side:      "short",
+    side,
+    strategy,
     entry,
-    tp1:       +(entry * (1 - 0.015)).toFixed(6),   // -1.5% partial exit
-    tp2:       +(entry * (1 - 0.030)).toFixed(6),   // -3.0% full exit
-    sl:        +(entry * (1 + 0.015)).toFixed(6),   // +1.5% stop loss
-    slBE:      null,                                 // breakeven SL after TP1 hit
-    size:      tradeSize,
-    tp1Hit:    false,
-    status:    "open",
-    openTime:  new Date().toISOString(),
-    orderId:   orderId || null,
+    tp1:      isHermesStrat ? +(entry * (1 - 0.015)).toFixed(6) : null,
+    tp2:      isHermesStrat ? +(entry * (1 - 0.030)).toFixed(6) : null,
+    sl:       isHermesStrat ? +(entry * (1 + 0.015)).toFixed(6) : null,
+    slBE:     null,
+    size:     tradeSize,
+    tp1Hit:   false,
+    status:   "open",
+    openTime: new Date().toISOString(),
+    orderId:  orderId || null,
   });
   savePositions(filtered);
-  console.log(`  📌 Position opened: SHORT ${symbol} @ $${entry} | TP1=$${+(entry*(1-0.015)).toFixed(4)} TP2=$${+(entry*(1-0.030)).toFixed(4)} SL=$${+(entry*(1+0.015)).toFixed(4)}`);
+
+  if (isHermesStrat) {
+    console.log(`  📌 Hermes position: ${side.toUpperCase()} ${symbol} @ $${entry} | TP1=$${+(entry*(1-0.015)).toFixed(4)} TP2=$${+(entry*(1-0.030)).toFixed(4)} SL=$${+(entry*(1+0.015)).toFixed(4)}`);
+  } else {
+    console.log(`  📌 VWAP position: ${side.toUpperCase()} ${symbol} @ $${entry} | tracked for conflict guard`);
+  }
+}
+
+// Keep alias for backward compat in dual-scan function
+function openHermesPosition(symbol, entry, tradeSize, orderId) {
+  openPositionRecord(symbol, "short", entry, tradeSize, "hermes_v05", orderId);
 }
 
 async function checkHermesPositions(log) {
@@ -372,7 +394,20 @@ async function checkHermesPositions(log) {
   const open = positions.filter((p) => p.status === "open");
   if (!open.length) return;
 
-  console.log(`\n─── Hermes Position Manager (${open.length} open) ──────────────`);
+  console.log(`\n─── Position Manager (${open.length} open) ─────────────────────`);
+
+  // Auto-expire VWAP positions after 4 hours (bot doesn't manage their exits)
+  for (const pos of open) {
+    const isVwap = !pos.tp1 && !pos.tp2;
+    if (isVwap) {
+      const ageHrs = (Date.now() - new Date(pos.openTime).getTime()) / 3600000;
+      if (ageHrs >= 4) {
+        pos.status = "closed"; pos.closeReason = "vwap_expiry"; pos.closeTime = new Date().toISOString();
+        console.log(`  ⏱️  VWAP ${pos.symbol} position expired after ${ageHrs.toFixed(1)}h — slot freed`);
+      }
+    }
+  }
+  savePositions(open.map(p => p)); // save expiry updates before Hermes checks
 
   for (const pos of open) {
     // Fetch current price (use 5m for tight exit tracking)
@@ -464,6 +499,14 @@ async function processAsset(asset, log) {
     return false;
   }
 
+  // ── Position conflict guard ───────────────────────────────────────────────
+  // Block new entry if this asset already has an open position (Hermes or VWAP)
+  // Prevents: VWAP buy on NEAR while Hermes short is running, and vice versa
+  if (hasOpenPosition(asset.symbol)) {
+    console.log(`  🔒 BLOCKED — ${asset.symbol} already has an open position. Skipping ${result.side.toUpperCase()} signal.`);
+    return false;
+  }
+
   console.log(`  🎯 SIGNAL: ${result.side.toUpperCase()} — ${result.reason}`);
 
   const tradeSize = getTradeSize();
@@ -472,18 +515,19 @@ async function processAsset(asset, log) {
     console.log(`  📋 PAPER: Would ${result.side.toUpperCase()} $${tradeSize} of ${asset.symbol} @ $${price.toFixed(4)}`);
     writeTradeCsv({ symbol: asset.symbol, strategy: asset.strategy, side: result.side, price, tradeSize, mode: "PAPER", signal: result.reason });
     log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: result.side, price, orderPlaced: true, paper: true });
+    // Track paper positions too so conflict guard works in paper mode
+    openPositionRecord(asset.symbol, result.side, price, tradeSize, asset.strategy, null);
     return true;
   }
 
-  // Live execution
-  // Hermes = perpetual (true short), VWAP = spot (token buy/sell)
+  // Live execution — Hermes=perpetual (true short), VWAP=spot (token buy/sell)
   const execMode = isHermes ? "linear" : "spot";
   try {
     const order = await placeBybitOrder(asset.symbol, result.side, tradeSize, price, execMode);
     console.log(`  ✅ ORDER PLACED: ${result.side.toUpperCase()} ${asset.symbol} [${execMode}] | ID: ${order.orderId}`);
     writeTradeCsv({ symbol: asset.symbol, strategy: asset.strategy, side: result.side, price, tradeSize, orderId: order.orderId, mode: `LIVE-${execMode.toUpperCase()}`, signal: result.reason });
     log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: result.side, price, orderPlaced: true, orderId: order.orderId, execMode });
-    if (isHermes) openHermesPosition(asset.symbol, price, tradeSize, order.orderId);
+    openPositionRecord(asset.symbol, result.side, price, tradeSize, asset.strategy, order.orderId);
     return true;
   } catch (err) {
     console.log(`  ❌ Order failed: ${err.message}`);
@@ -501,6 +545,13 @@ async function processHermesDualScan(asset, log) {
   }
   const price     = candles[candles.length - 1].close;
   const tradeSize = getTradeSize();
+
+  // Position conflict guard
+  if (hasOpenPosition(asset.symbol)) {
+    console.log(`  🔒 BLOCKED — ${asset.symbol} already has an open position. Skipping Hermes ${result.side.toUpperCase()}.`);
+    return false;
+  }
+
   console.log(`  🎯 ${asset.symbol} HERMES(${CONFIG.hermesTimeframe}) SIGNAL: ${result.side.toUpperCase()} — ${result.reason}`);
   if (CONFIG.paperTrading) {
     writeTradeCsv({ symbol: asset.symbol, strategy: "hermes_v04", side: result.side, price, tradeSize, mode: "PAPER", signal: result.reason });
