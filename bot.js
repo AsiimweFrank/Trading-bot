@@ -133,7 +133,7 @@ function getTradeSize() {
 const WATCHLIST = [
   { symbol: "NEARUSDT", okx: "NEAR-USDT", strategy: "vwap_rsi3_ema8", hermesAlso: true,  trendVote: 0  },
   { symbol: "SOLUSDT",  okx: "SOL-USDT",  strategy: "vwap_rsi3_ema8", hermesAlso: true,  trendVote: 0  },
-  { symbol: "ETHUSDT",  okx: "ETH-USDT",  strategy: "hermes_v03",                         trendVote: 0  },
+  { symbol: "ETHUSDT",  okx: "ETH-USDT",  strategy: "vwap_rsi3_ema8", hermesAlso: true,  trendVote: 0  },
   { symbol: "BTCUSDT",  okx: "BTC-USDT",  strategy: "vwap_rsi3_ema8",                     trendVote: 12 },
 ];
 
@@ -708,29 +708,39 @@ async function checkVwapPositions(log) {
     const price  = closes[closes.length - 1];
     const rsi3   = calcRSI(closes, 3);
     const rsi3Prev = calcRSI(closes.slice(0, -1), 3);
-    const pct    = ((price - pos.entry) / pos.entry * 100).toFixed(2);
-    const sl     = pos.entry * (1 - 0.003); // 0.3% stop loss
+    const pct    = ((price - pos.entry) / pos.entry * 100);
 
-    console.log(`  ${pos.symbol}: entry=$${pos.entry} now=$${price.toFixed(4)} P&L=${pct}% | RSI3=${rsi3?.toFixed(1)} SL=$${sl.toFixed(4)}`);
+    // ── #7 Trailing stop: once +1% profit, move SL to breakeven ─────────────
+    // Locks in trade as risk-free. If price keeps going, hold past 4H.
+    // pos.slBE is set the first time profit reaches +1% and never moves back.
+    const profitPct = (price - pos.entry) / pos.entry * 100;
+    if (!pos.slBE && profitPct >= 1.0) {
+      pos.slBE = pos.entry; // move SL to breakeven
+      console.log(`  🔒 Trailing stop activated — SL moved to breakeven $${pos.entry} (profit +${profitPct.toFixed(2)}%)`);
+      await tg(`🔒 <b>VWAP trailing stop — ${pos.symbol}</b>\nProfit +${profitPct.toFixed(2)}% → SL moved to breakeven $${pos.entry}\nLetting winner run! 🚀`);
+    }
+    const sl = pos.slBE ?? (pos.entry * (1 - 0.003)); // breakeven or 0.3% SL
+
+    console.log(`  ${pos.symbol}: entry=$${pos.entry} now=$${price.toFixed(4)} P&L=${pct.toFixed(2)}% | RSI3=${rsi3?.toFixed(1)} SL=$${sl.toFixed(4)}${pos.slBE?" [BE]":""}`);
 
     let exitReason = null;
 
     // Exit 1: RSI(3) crosses above 50 — trend exhausted, take profit
     if (rsi3 && rsi3Prev && rsi3Prev < 50 && rsi3 >= 50) {
       exitReason = "rsi3_cross_50";
-      console.log(`  🎯 RSI(3) crossed 50 — taking profit @ $${price.toFixed(4)} | P&L: ${pct}%`);
+      console.log(`  🎯 RSI(3) crossed 50 — taking profit @ $${price.toFixed(4)} | P&L: ${pct.toFixed(2)}%`);
     }
-    // Exit 2: stop loss hit
+    // Exit 2: stop loss hit (fixed 0.3% or breakeven after trailing)
     else if (price <= sl) {
-      exitReason = "stop_loss";
-      console.log(`  🛑 SL HIT @ $${price.toFixed(4)} | P&L: ${pct}%`);
+      exitReason = pos.slBE ? "trailing_stop_be" : "stop_loss";
+      console.log(`  🛑 ${pos.slBE?"BE stop":"SL"} HIT @ $${price.toFixed(4)} | P&L: ${pct.toFixed(2)}%`);
     }
-    // Exit 3: 4-hour time expiry (fallback)
-    else {
+    // Exit 3: 4-hour time expiry — only if NOT in breakeven mode (let winners run)
+    else if (!pos.slBE) {
       const ageHrs = (Date.now() - new Date(pos.openTime).getTime()) / 3600000;
       if (ageHrs >= 4) {
         exitReason = "time_expiry_4h";
-        console.log(`  ⏱️  4h expiry — closing @ $${price.toFixed(4)} | P&L: ${pct}%`);
+        console.log(`  ⏱️  4h expiry — closing @ $${price.toFixed(4)} | P&L: ${pct.toFixed(2)}%`);
       }
     }
 
@@ -759,8 +769,8 @@ async function checkVwapPositions(log) {
       log.trades.push({ timestamp: new Date().toISOString(), symbol: pos.symbol, side: "sell", price, orderPlaced: true, reason: exitReason });
 
       // Telegram exit alert
-      const exitEmoji = { rsi3_cross_50: "✅", stop_loss: "🛑", time_expiry_4h: "⏱️" };
-      const exitLabel = { rsi3_cross_50: "RSI3 crossed 50 — trend done", stop_loss: "Stop loss hit", time_expiry_4h: "4H time expiry" };
+      const exitEmoji = { rsi3_cross_50: "✅", stop_loss: "🛑", trailing_stop_be: "🔒", time_expiry_4h: "⏱️" };
+      const exitLabel = { rsi3_cross_50: "RSI3 crossed 50 — trend done", stop_loss: "Stop loss hit", trailing_stop_be: "Breakeven stop hit (profit locked)", time_expiry_4h: "4H time expiry" };
       await tg(
 `${exitEmoji[exitReason]||"🔔"} <b>VWAP EXIT — ${pos.symbol}</b>
 📍 Entry:  $${pos.entry}
