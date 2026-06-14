@@ -50,8 +50,8 @@ const CONFIG = {
     baseUrl:   process.env.BYBIT_BASE_URL || "https://api.bybit.com",
   },
   telegram: {
-    token:  process.env.TELEGRAM_TOKEN   || "8705134965:AAHrzaLoWxN1reDrc1BqiFzS-XC4aD-E2gU",
-    chatId: process.env.TELEGRAM_CHAT_ID || "5226302822",
+    token:  process.env.TELEGRAM_TOKEN,
+    chatId: process.env.TELEGRAM_CHAT_ID,
   },
 };
 
