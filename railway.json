@@ -4,9 +4,8 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "node bot.js",
-    "cronSchedule": "*/5 * * * *",
-    "restartPolicyType": "ON_FAILURE",
-    "restartPolicyMaxRetries": 3
+    "startCommand": "node scanner.mjs",
+    "restartPolicyType": "ALWAYS",
+    "restartPolicyMaxRetries": 10
   }
 }

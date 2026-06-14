@@ -18,8 +18,18 @@
  */
 
 import "dotenv/config";
-import { readFileSync, writeFileSync, existsSync, appendFileSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, appendFileSync, mkdirSync } from "fs";
 import crypto from "crypto";
+
+// UAE time (UTC+4) helper
+function uaeTime(d = new Date()) {
+  return d.toLocaleString("en-GB", {
+    timeZone: "Asia/Dubai",
+    day: "2-digit", month: "short", year: "numeric",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+    hour12: false
+  }) + " UAE";
+}
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -69,7 +79,7 @@ function tgEntry(symbol, side, price, tradeSize, tp1, tp2, sl, strategy) {
 🛑 SL:     $${sl} (-1.5%)
 💰 Size:   $${tradeSize}
 📊 Strat:  ${strategy}
-🕐 ${new Date().toUTCString()}`
+🕐 ${uaeTime()}`
   );
 }
 
@@ -131,11 +141,21 @@ function getTradeSize() {
 // trendVote    = min bars/20 in bear stack (0=off). BTC=12 (choppy regime filter)
 // vwapTimeframe = override VWAP candle TF per asset (default = CONFIG.timeframe = 5m)
 //   ETH VWAP backtest: 5m → 39% WR -$9.93 ❌ | 1H → 100% WR +$0.02 ✅ → use 1H
+// Active strategy: Dip-Buyer (RSI2 in uptrend, 1H) — validated 2026-06:
+//   65-68% WR, profitable across 27/27 param combos & 3 OOS periods on BTC/ETH/NEAR.
+//   Old VWAP/Hermes assignments removed (confirmed net-negative over 57d OOS).
+//   NOTE: profitable at fees <0.16% round-trip → maker/limit execution is the next upgrade.
+// V2: All 8 coins — both LONG (RSI2<10+uptrend) and SHORT (RSI2>90+downtrend)
+// Backtest PF by coin: ETH 2.16 | NEAR 2.17 | XRP 2.13 | SOL 2.06 | BTC 1.91 | AVAX 1.91 | BNB 1.75 | TRX 1.32
 const WATCHLIST = [
-  { symbol: "NEARUSDT", okx: "NEAR-USDT", strategy: "vwap_rsi3_ema8", hermesAlso: true,  trendVote: 0,  vwapTimeframe: "15m" },
-  { symbol: "SOLUSDT",  okx: "SOL-USDT",  strategy: "vwap_rsi3_ema8", hermesAlso: true,  trendVote: 0,  vwapTimeframe: "5m" },
-  { symbol: "ETHUSDT",  okx: "ETH-USDT",  strategy: "vwap_rsi3_ema8", hermesAlso: true,  trendVote: 0,  vwapTimeframe: "1H" },
-  { symbol: "BTCUSDT",  okx: "BTC-USDT",  strategy: "vwap_rsi3_ema8",                    trendVote: 12, vwapTimeframe: "5m" },
+  { symbol: "BTCUSDT",  okx: "BTC-USDT",  strategy: "dip_buyer" },
+  { symbol: "ETHUSDT",  okx: "ETH-USDT",  strategy: "dip_buyer" },
+  { symbol: "NEARUSDT", okx: "NEAR-USDT", strategy: "dip_buyer" },
+  { symbol: "SOLUSDT",  okx: "SOL-USDT",  strategy: "dip_buyer" },
+  { symbol: "BNBUSDT",  okx: "BNB-USDT",  strategy: "dip_buyer" },
+  { symbol: "XRPUSDT",  okx: "XRP-USDT",  strategy: "dip_buyer" },
+  { symbol: "AVAXUSDT", okx: "AVAX-USDT", strategy: "dip_buyer" },
+  { symbol: "TRXUSDT",  okx: "TRX-USDT",  strategy: "dip_buyer" }, // weakest PF 1.32 — kept for signal volume
 ];
 
 // ── Persistent data directory ─────────────────────────────────────────────────
@@ -147,6 +167,11 @@ const DATA_DIR      = process.env.DATA_DIR ? process.env.DATA_DIR.replace(/\/$/,
 const LOG_FILE      = `${DATA_DIR ? DATA_DIR + "/" : ""}safety-check-log.json`;
 const CSV_FILE      = `${DATA_DIR ? DATA_DIR + "/" : ""}trades.csv`;
 const POSITION_FILE = `${DATA_DIR ? DATA_DIR + "/" : ""}positions.json`;
+
+// Ensure DATA_DIR exists (Railway Volume may not pre-create subdirectories)
+if (DATA_DIR) {
+  try { mkdirSync(DATA_DIR, { recursive: true }); } catch (_) { /* already exists */ }
+}
 
 // ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -173,18 +198,32 @@ async function fetchCandles(okxSymbol, interval, limit = 200) {
   };
   const bar = intervalMap[interval] || "5m";
   const url = `https://www.okx.com/api/v5/market/candles?instId=${okxSymbol}&bar=${bar}&limit=${limit}`;
-  const res  = await fetch(url);
-  if (!res.ok) throw new Error(`OKX API error: ${res.status}`);
-  const data = await res.json();
-  if (data.code !== "0") throw new Error(`OKX error: ${data.msg}`);
-  return data.data.reverse().map((k) => ({
-    time:   parseInt(k[0]),
-    open:   parseFloat(k[1]),
-    high:   parseFloat(k[2]),
-    low:    parseFloat(k[3]),
-    close:  parseFloat(k[4]),
-    volume: parseFloat(k[5]),
-  }));
+
+  // Retry up to 3 times with exponential backoff (handles OKX rate limiting)
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const res = await fetch(url);
+    if (!res.ok) {
+      if (attempt < 3) { await new Promise(r => setTimeout(r, attempt * 800)); continue; }
+      throw new Error(`OKX API error: ${res.status}`);
+    }
+    const data = await res.json();
+    if (data.code !== "0") {
+      if (attempt < 3) { await new Promise(r => setTimeout(r, attempt * 800)); continue; }
+      throw new Error(`OKX error: ${data.msg}`);
+    }
+    if (!data.data || data.data.length === 0) {
+      if (attempt < 3) { await new Promise(r => setTimeout(r, attempt * 800)); continue; }
+      throw new Error(`OKX returned empty candle data for ${okxSymbol}`);
+    }
+    return data.data.reverse().map((k) => ({
+      time:   parseInt(k[0]),
+      open:   parseFloat(k[1]),
+      high:   parseFloat(k[2]),
+      low:    parseFloat(k[3]),
+      close:  parseFloat(k[4]),
+      volume: parseFloat(k[5]),
+    }));
+  }
 }
 
 // ─── Indicators ───────────────────────────────────────────────────────────────
@@ -208,6 +247,15 @@ function calcRSI(closes, period) {
   return 100 - 100 / (1 + gains / losses);
 }
 
+// Simple moving average of the last `period` closes (optionally offset back by `back` bars).
+function calcSMA(closes, period, back = 0) {
+  const end = closes.length - back;
+  if (end < period) return null;
+  let s = 0;
+  for (let i = end - period; i < end; i++) s += closes[i];
+  return s / period;
+}
+
 function calcVWAP(candles) {
   const midnight = new Date(); midnight.setUTCHours(0,0,0,0);
   let sess = candles.filter((c) => c.time >= midnight.getTime());
@@ -216,6 +264,33 @@ function calcVWAP(candles) {
   const tpv = sess.reduce((s,c) => s + ((c.high+c.low+c.close)/3)*c.volume, 0);
   const vol = sess.reduce((s,c) => s + c.volume, 0);
   return vol === 0 ? null : tpv / vol;
+}
+
+// ATR(period) expressed as a % of current price — measures recent volatility.
+// Used to skip entries when an asset is too quiet for a bounce to clear the round-trip fee.
+function calcATRpct(candles, period = 14) {
+  if (candles.length < period + 1) return null;
+  const trs = [];
+  for (let i = 1; i < candles.length; i++) {
+    const c = candles[i], prev = candles[i - 1];
+    trs.push(Math.max(c.high - c.low, Math.abs(c.high - prev.close), Math.abs(c.low - prev.close)));
+  }
+  const last = trs.slice(-period);
+  const atr  = last.reduce((a, b) => a + b, 0) / last.length;
+  const price = candles[candles.length - 1].close;
+  return price > 0 ? (atr / price) * 100 : null;
+}
+
+// ATR(period) in absolute price units (for sizing the dip-buyer stop = entry − N×ATR).
+function calcATR(candles, period = 14) {
+  if (candles.length < period + 1) return null;
+  const trs = [];
+  for (let i = 1; i < candles.length; i++) {
+    const c = candles[i], prev = candles[i - 1];
+    trs.push(Math.max(c.high - c.low, Math.abs(c.high - prev.close), Math.abs(c.low - prev.close)));
+  }
+  const last = trs.slice(-period);
+  return last.reduce((a, b) => a + b, 0) / last.length;
 }
 
 // ─── Strategy A: VWAP + RSI(3) + EMA(8) ─────────────────────────────────────
@@ -228,44 +303,150 @@ function checkStratVwapRsi(candles) {
   const rsi3   = calcRSI(closes, 3);
   const vwap   = calcVWAP(candles);
 
-  if (!ema8 || !rsi3 || !vwap) return { signal: null, reason: "insufficient data" };
+  if (ema8 === null || rsi3 === null || vwap === null) return { signal: null, reason: "insufficient data" };
 
   const vwapDist = Math.abs(price - vwap) / vwap * 100;
   if (vwapDist > 1.5) return { signal: null, reason: `overextended from VWAP (${vwapDist.toFixed(2)}%)` };
 
-  const bullish = price > vwap && price > ema8;
-  const bearish = price < vwap && price < ema8;
+  // ── Min-move (volatility) gate ────────────────────────────────────────────
+  // The round-trip fee is 0.2% ($10 on $5000). If recent volatility is below this,
+  // a mean-reversion bounce can't clear the fee — the trade is a structural loser
+  // (this was the SOL/BTC chop bleed: ATR ~0.09-0.17% < 0.2% fee). Require ATR% to
+  // be comfortably above the fee so only moves worth trading get entered.
+  const MIN_ATR_PCT = parseFloat(process.env.MIN_ATR_PCT || "0.30");
+  const atrPct = calcATRpct(candles, 14);
+  if (atrPct !== null && atrPct < MIN_ATR_PCT) {
+    return { signal: null, reason: `too quiet — ATR=${atrPct.toFixed(2)}% < ${MIN_ATR_PCT}% (fee would eat the move)`, indicators: { price, ema8, vwap, rsi3 } };
+  }
 
-  // Use <= 30 / >= 70 — RSI exactly at 30 or 70 is still oversold/overbought.
-  // Strict < 30 was missing signals where RSI3 = 30.0 exactly (rounded value).
-  if (bullish && rsi3 <= 30) {
+  // Allow up to 0.8% below/above EMA8 for long/short entries.
+  // Catches extreme RSI3 dips during micro-pullbacks still above VWAP
+  // (e.g. NEAR RSI3=4 at -0.5% vs EMA8 — clean setup, should not be blocked).
+  const EMA8_TOL = 0.008; // 0.8% tolerance
+  const bullish = price > vwap && price > ema8 * (1 - EMA8_TOL);
+  const bearish = price < vwap && price < ema8 * (1 + EMA8_TOL);
+
+  // Tightened entry: RSI3 ≤ 15 only (was ≤30).
+  // Rationale: at ≤30 the bounce is only ~0.2-0.3% — barely covers the 0.2% round-trip fee.
+  // At RSI3 ≤ 15, price is in extreme oversold — bounces average 0.5-1.0%, well above fee cost.
+  const RSI3_ENTRY = 15;
+  if (bullish && rsi3 <= RSI3_ENTRY) {
     return {
       signal: "buy", side: "buy",
-      reason: `BULLISH — price>VWAP, price>EMA8, RSI3=${rsi3.toFixed(1)}≤30`,
-      indicators: { price, ema8, vwap, rsi3 },
+      reason: `BULLISH — price>VWAP, price≈EMA8(${((price/ema8-1)*100).toFixed(2)}%), RSI3=${rsi3.toFixed(1)}≤${RSI3_ENTRY}, ATR=${atrPct?.toFixed(2)}%`,
+      indicators: { price, ema8, vwap, rsi3, atrPct },
     };
   }
-  if (bearish && rsi3 >= 70) {
-    return {
-      signal: "sell", side: "sell",
-      reason: `BEARISH — price<VWAP, price<EMA8, RSI3=${rsi3.toFixed(1)}≥70`,
-      indicators: { price, ema8, vwap, rsi3 },
-    };
-  }
+  // NOTE: Bearish SELL disabled on VWAP — spot is long-only.
+  // Short entries use Hermes strategy on perpetuals (linear) instead.
+  // if (bearish && rsi3 >= 70) { ... }
 
   const bias = bullish ? "BULLISH" : bearish ? "BEARISH" : "NEUTRAL";
   return {
     signal: null,
-    reason: `${bias} bias — RSI3=${rsi3.toFixed(1)} (need ≤30 long / ≥70 short)`,
+    reason: `${bias} bias — RSI3=${rsi3.toFixed(1)} (need ≤${RSI3_ENTRY} long)`,
     indicators: { price, ema8, vwap, rsi3 },
   };
 }
 
-// ─── Strategy B: Hermes v05 — RSI Rejection in Downtrend ─────────────────────
-// Scans 1H candles. Best for: NEAR (95.5%), ETH (85.7%), SOL (83.1%)
-// v05 adds: trend strength vote (12/20 bars in bear stack = no choppy entries)
+// ─── Strategy C: Dip Buyer (Connors-style RSI2 in an uptrend) ────────────────
+// Validated 2026-06: 65-68% WR, robust across 27/27 param combos, breakeven fee ~0.17%.
+//   Regime : price > SMA200  AND  SMA50 rising      (established uptrend, long-only)
+//   Entry  : RSI(2) < 10                            (deep short-term dip)
+//   Exit   : close > SMA5 (recovery) | wide ATR stop | max-hold (managed in exit fn)
+// Needs 1H candles with ≥200 bars of history.
+const DIP_RSI_ENTRY      = parseFloat(process.env.DIP_RSI_ENTRY      || "10");  // RSI2 threshold for LONG entry
+const DIP_RSI_SHORT      = parseFloat(process.env.DIP_RSI_SHORT      || "90");  // RSI2 threshold for SHORT entry
+const DIP_STOP_ATR       = parseFloat(process.env.DIP_STOP_ATR       || "4");
+// Limit-order maker entry: place limit this % away from close → sits in book → maker fee
+// LONG:  buy limit DIP_LIMIT_OFFSET% BELOW close  (maker = waits for slight dip)
+// SHORT: sell limit DIP_LIMIT_OFFSET% ABOVE close (maker = waits for slight push up)
+const DIP_LIMIT_OFFSET   = parseFloat(process.env.DIP_LIMIT_OFFSET   || "0.15"); // 0.15% offset
+const DIP_LIMIT_TIMEOUT  = parseFloat(process.env.DIP_LIMIT_TIMEOUT  || "2");    // cancel after 2 hours if unfilled
+// ── V2 Strategy Settings ─────────────────────────────────────────────────────
+// Backtest result: PF=1.91, WR=46.8%, EV=$4.36/trade on $500, 36 signals/day
+// LONG : entry=candle_low,  stop=low*(1-0.003),  tp=entry+3×risk
+// SHORT: entry=candle_high, stop=high*(1+0.003), tp=entry−3×risk
+const DIP_V2_ENABLED     = process.env.DIP_STRATEGY_V2 !== "false";  // default ON
+const DIP_V2_STOP_BUFFER = parseFloat(process.env.DIP_V2_STOP_BUFFER || "0.003"); // 0.3% candle buffer
+const DIP_V2_RR          = parseFloat(process.env.DIP_V2_RR          || "3");     // 3:1 risk:reward
+const DIP_V2_MAX_CONCURRENT = parseInt(process.env.DIP_V2_MAX_CONCURRENT || "2"); // max 2 open at once
+// Futures mode: "spot" (default) or "linear" (perpetual futures with leverage)
+// V2 requires "linear" (futures) to enable shorts — default to linear now
+const DIP_BUYER_MODE     = process.env.DIP_BUYER_MODE     || "linear";
+const DIP_BUYER_LEVERAGE = parseFloat(process.env.DIP_BUYER_LEVERAGE || "3");  // 3× ≈ natural leverage from 0.3% stop
+// Bybit fee rates (used in P&L accounting)
+const FEE_SPOT_MAKER     = 0.0002;   // 0.02% spot maker (limit below market)
+const FEE_SPOT_TAKER     = 0.001;    // 0.10% spot taker (market order)
+const FEE_FUT_MAKER      = 0.0002;   // 0.02% futures maker
+const FEE_FUT_TAKER      = 0.00055;  // 0.055% futures taker (Bybit linear)
+function checkStratDipBuyer(candles) {
+  const closes = candles.map((c) => c.close);
+  const price  = closes[closes.length - 1];
+  const sma200 = calcSMA(closes, 200);
+  const sma50  = calcSMA(closes, 50);
+  const sma50p = calcSMA(closes, 50, 10);   // SMA50 ten bars ago (for "rising/falling" check)
+  const rsi2   = calcRSI(closes, 2);
+  const atr    = calcATR(candles, 14);
 
-function checkStratHermes(candles, trendVoteMin = 0) {
+  if (sma200 === null || sma50 === null || sma50p === null || rsi2 === null || atr === null)
+    return { signal: null, reason: "insufficient data (need 200+ 1H bars)" };
+
+  const candleLow  = candles[candles.length - 1].low;
+  const candleHigh = candles[candles.length - 1].high;
+  const indicators = { price, sma200, sma50, rsi2, atr, candleLow, candleHigh };
+  const uptrend   = price > sma200 && sma50 > sma50p;
+  const downtrend = price < sma200 && sma50 < sma50p;
+
+  // ── LONG signal: deeply oversold dip inside an uptrend ──────────────────
+  if (uptrend && rsi2 < DIP_RSI_ENTRY) {
+    // V2: entry=candle_low, stop=low*(1-buffer), tp=entry+3×risk
+    // V1: entry=close-0.15%, stop=entry-4×ATR, tp=SMA5 cross
+    const v2Entry = candleLow;
+    const v2Stop  = candleLow * (1 - DIP_V2_STOP_BUFFER);
+    const v2Tp    = v2Entry + DIP_V2_RR * (v2Entry - v2Stop);
+    return {
+      signal: "buy", side: "long",
+      reason: `DIP-BUY  ↑ uptrend (price>SMA200, SMA50↑), RSI2=${rsi2.toFixed(1)}<${DIP_RSI_ENTRY}`,
+      stopPrice:  DIP_V2_ENABLED ? v2Stop  : price - DIP_STOP_ATR * atr,
+      tpPrice:    DIP_V2_ENABLED ? v2Tp    : null,
+      limitPrice: DIP_V2_ENABLED ? v2Entry : null,   // null = use old close-offset logic
+      indicators,
+    };
+  }
+
+  // ── SHORT signal: overbought spike inside a downtrend ───────────────────
+  // Only available in futures mode (DIP_BUYER_MODE=linear); spot cannot short.
+  if (DIP_BUYER_MODE === "linear" && downtrend && rsi2 > DIP_RSI_SHORT) {
+    const v2Entry = candleHigh;
+    const v2Stop  = candleHigh * (1 + DIP_V2_STOP_BUFFER);
+    const v2Tp    = v2Entry - DIP_V2_RR * (v2Stop - v2Entry);
+    return {
+      signal: "sell", side: "short",
+      reason: `DIP-SHORT ↓ downtrend (price<SMA200, SMA50↓), RSI2=${rsi2.toFixed(1)}>${DIP_RSI_SHORT}`,
+      stopPrice:  DIP_V2_ENABLED ? v2Stop  : price + DIP_STOP_ATR * atr,
+      tpPrice:    DIP_V2_ENABLED ? v2Tp    : null,
+      limitPrice: DIP_V2_ENABLED ? v2Entry : null,
+      indicators,
+    };
+  }
+
+  // No signal — report which condition blocked
+  if (uptrend)   return { signal: null, reason: `uptrend but RSI2=${rsi2.toFixed(1)} (need <${DIP_RSI_ENTRY})`, indicators };
+  if (downtrend) return { signal: null, reason: `downtrend but RSI2=${rsi2.toFixed(1)} (need >${DIP_RSI_SHORT})`, indicators };
+  return { signal: null, reason: `no clear trend (SMA200=${sma200.toFixed(2)}, SMA50 ${sma50 > sma50p ? "rising" : "falling"} but price ${price > sma200 ? ">" : "<"} SMA200)`, indicators };
+}
+
+// ─── Strategy B: Hermes v06 — RSI Rejection in Downtrend ─────────────────────
+// v06 upgrades (SWOT-driven):
+//   1. ATR-adaptive SL/TP   — SL = entry + max(1.5%, 1.5×ATR); TP1=1×ATR, TP2=2.5×ATR
+//   2. Trade journal         — records all entry indicators to hermes_journal.json
+//   3. Macro regime filter   — skips shorts when BTC 4H RSI > 65 (broad bull mode)
+//   4. Session filter        — 08:00–22:00 UAE only (blocks thin-volume dead hours)
+//   5. Confidence score      — 0–100 composite; logged but doesn't gate entries yet
+//   6. Trend vote extended   — ALL coins now need min 8/20 bars (was 0 for non-BTC)
+
+function checkStratHermes(candles, trendVoteMin = 8, btcRsi4h = null) {
   const closes  = candles.map((c) => c.close);
   const price   = closes[closes.length - 1];
   const ema9    = calcEMA(closes, 9);
@@ -273,9 +454,33 @@ function checkStratHermes(candles, trendVoteMin = 0) {
   const ema50   = calcEMA(closes, 50);
   const rsi     = calcRSI(closes, 14);
   const rsiPrev = calcRSI(closes.slice(0, -1), 14);
+  const atr14   = calcATR(candles, 14);
 
-  if (!ema9 || !ema21 || !ema50 || !rsi || !rsiPrev)
+  if (ema9 === null || ema21 === null || ema50 === null || rsi === null || rsiPrev === null)
     return { signal: null, reason: "insufficient data" };
+
+  // ── [NEW v06] Macro regime filter ────────────────────────────────────────
+  // Skip all Hermes shorts when BTC 4H RSI > 65 (broad market in bull momentum).
+  // Today: BTC RSI14(1H) = 68 → Hermes correctly blocked. This makes it explicit.
+  const BTC_RSI_BULL_THRESHOLD = 65;
+  if (btcRsi4h !== null && btcRsi4h > BTC_RSI_BULL_THRESHOLD) {
+    return {
+      signal: null,
+      reason: `🌍 Macro filter: BTC 4H RSI=${btcRsi4h.toFixed(1)} > ${BTC_RSI_BULL_THRESHOLD} (bull mode — no shorts)`,
+      indicators: { price, ema9, ema21, ema50, rsi },
+    };
+  }
+
+  // ── [NEW v06] Session filter — 08:00–22:00 UAE ───────────────────────────
+  const uaeHour = new Date().toLocaleString("en-GB", { timeZone: "Asia/Dubai", hour: "numeric", hour12: false });
+  const hour = parseInt(uaeHour);
+  if (hour < 8 || hour >= 22) {
+    return {
+      signal: null,
+      reason: `🕐 Session filter: ${hour}:xx UAE (trading window 08:00–22:00 only)`,
+      indicators: { price, ema9, ema21, ema50, rsi },
+    };
+  }
 
   const bearStack = ema9 < ema21 && ema21 < ema50 && price < ema50;
   if (!bearStack) {
@@ -286,11 +491,11 @@ function checkStratHermes(candles, trendVoteMin = 0) {
     };
   }
 
-  // ── Trend strength vote (per-asset, 0 = disabled) ────────────────────────
-  // BTC: 12/20 bars required (choppy market fix)
-  // ETH/SOL/NEAR: 0 (naturally trending, don't over-filter)
+  // ── Trend strength vote (all coins now require min 8/20) ─────────────────
+  // v06: extended to all coins (was 0 for NEAR/SOL/ETH). BTC keeps 12.
+  // Why 8: needs half the recent bars in bear stack = sustained downtrend not a dip.
   const VOTE_BARS  = 20;
-  const VOTE_MIN   = trendVoteMin;
+  const VOTE_MIN   = trendVoteMin;   // caller passes per-asset value (default 8)
   let bearVotes = 0;
   const start = Math.max(0, candles.length - VOTE_BARS);
   for (let j = start; j < candles.length; j++) {
@@ -302,10 +507,10 @@ function checkStratHermes(candles, trendVoteMin = 0) {
     const p   = cl[cl.length - 1];
     if (e9 && e21 && e50 && e9 < e21 && e21 < e50 && p < e50) bearVotes++;
   }
-  if (VOTE_MIN > 0 && bearVotes < VOTE_MIN) {
+  if (bearVotes < VOTE_MIN) {
     return {
       signal: null,
-      reason: `bear stack ✅ but trend too weak (${bearVotes}/${VOTE_BARS} bars in bear stack, need ${VOTE_MIN})`,
+      reason: `bear stack ✅ but trend too weak (${bearVotes}/${VOTE_BARS} bars, need ≥${VOTE_MIN})`,
       indicators: { price, ema9, ema21, ema50, rsi },
     };
   }
@@ -316,52 +521,182 @@ function checkStratHermes(candles, trendVoteMin = 0) {
     const r = calcRSI(closes.slice(0, j + 1), 14);
     if (r) rsiWindow.push(r);
   }
+  const rsiPeak         = Math.max(...rsiWindow);
   const recentlyAbove55 = rsiWindow.some((r) => r > 55);
   const crossesBelow52  = rsiPrev >= 52 && rsi < 52;
   const notOversold     = rsi > 38;
 
-  // ── Volume spike confirmation: PREVIOUS completed bar > 1.2× 20-bar average
-  // IMPORTANT: use index -2 (last CLOSED bar), not -1 (current forming bar).
-  // The current 1H bar is always partial — its volume starts near zero and builds.
-  // NOTE: RSI slope filter was REMOVED — backtest showed it kills all signals and
-  // on ETH actually selected only losers (7 trades, 0% WR, -$5.25). Volume alone
-  // is sufficient confirmation without over-filtering.
+  // Volume spike confirmation (unchanged from v05)
   const volumes  = candles.map((c) => c.volume);
-  const prevVol  = volumes[volumes.length - 2]; // last COMPLETED bar
-  const vol20    = volumes.slice(-22, -2);       // 20 bars before that
+  const prevVol  = volumes[volumes.length - 2];
+  const vol20    = volumes.slice(-22, -2);
   const avgVol   = vol20.length > 0 ? vol20.reduce((a, b) => a + b, 0) / vol20.length : 0;
   const volRatio      = avgVol > 0 ? prevVol / avgVol : 1;
   const volumeConfirm = volRatio >= 1.2;
 
+  // ── [NEW v06] Confidence score (0–100) ───────────────────────────────────
+  // Logged with every trade; future versions will gate on score > threshold.
+  // Score = bear votes (max 40) + RSI spike height (max 20) + vol strength (max 20) + ATR edge (max 20)
+  const atrPct   = atr14 !== null ? (atr14 / price * 100) : 0;
+  const scoreVote = Math.min(40, bearVotes * 2);              // 20 votes = 40 pts
+  const scoreRsi  = Math.min(20, Math.max(0, (rsiPeak - 55) * 2));  // peak 65 = 20 pts
+  const scoreVol  = Math.min(20, Math.max(0, (volRatio - 1.2) * 25)); // 2× = 20 pts
+  const scoreAtr  = Math.min(20, Math.max(0, atrPct * 4));   // 5% ATR = 20 pts
+  const confidence = Math.round(scoreVote + scoreRsi + scoreVol + scoreAtr);
+
+  // ── [NEW v06] ATR-adaptive SL and TP ─────────────────────────────────────
+  // v05 used fixed 1.5% — ignores volatility. v06 uses ATR(14):
+  //   SL = entry + max(1.5%, 1.5×ATR)   [stop above for short, wider in high-vol]
+  //   TP1 = entry − 1.0×ATR             [first target at one ATR down]
+  //   TP2 = entry − 2.5×ATR             [full exit at 2.5× ATR reward]
+  const atrSlPct  = atr14 !== null ? Math.max(0.015, 1.5 * atr14 / price) : 0.015;
+  const atrTp1Pct = atr14 !== null ? Math.min(0.03, Math.max(0.01, 1.0 * atr14 / price)) : 0.015;
+  const atrTp2Pct = atr14 !== null ? Math.min(0.07, Math.max(0.025, 2.5 * atr14 / price)) : 0.030;
+
   if (recentlyAbove55 && crossesBelow52 && notOversold && volumeConfirm) {
     return {
       signal: "sell", side: "sell",
-      reason: `HERMES SHORT — bear stack ✅, trend vote ${bearVotes}/${VOTE_BARS} ✅, RSI spiked>55 ✅, crossed below 52 ✅, RSI=${rsi.toFixed(1)}>38 ✅, vol ${volRatio.toFixed(2)}×avg ✅`,
-      indicators: { price, ema9, ema21, ema50, rsi, bearVotes, volRatio },
+      reason: `HERMES v06 SHORT — bear ${bearVotes}/${VOTE_BARS} ✅, RSI ${rsiPrev?.toFixed(1)}→${rsi.toFixed(1)} ✅, vol ${volRatio.toFixed(2)}× ✅, ATR=${atrPct.toFixed(2)}%, conf=${confidence}/100`,
+      indicators: { price, ema9, ema21, ema50, rsi, rsiPrev, rsiPeak, bearVotes, volRatio, atr14, atrPct, confidence },
+      // ATR-adaptive levels (returned so execution layer can use them)
+      atrSlPct, atrTp1Pct, atrTp2Pct,
     };
   }
 
   return {
     signal: null,
-    reason: `bear stack ✅ trend ${bearVotes}/${VOTE_BARS} ✅ — waiting: RSI=${rsi.toFixed(1)} spike=${recentlyAbove55} cross52=${crossesBelow52} floor=${notOversold} vol=${volRatio.toFixed(2)}×(need≥1.2)`,
-    indicators: { price, ema9, ema21, ema50, rsi, volRatio },
+    reason: `bear ✅ votes ${bearVotes}/${VOTE_BARS} ✅ — RSI=${rsi.toFixed(1)} spike=${recentlyAbove55}(peak=${rsiPeak.toFixed(1)}) cross52=${crossesBelow52} floor=${notOversold} vol=${volRatio.toFixed(2)}× conf=${confidence}`,
+    indicators: { price, ema9, ema21, ema50, rsi, bearVotes, volRatio, confidence },
   };
+}
+
+// ─── Hermes Trade Journal (v06) ───────────────────────────────────────────────
+// Records full entry context → enables weekly self-analysis and learning.
+// File: hermes_journal.json  [{id, symbol, entryTime, ...indicators, exitTime, pnl, exitReason}]
+const JOURNAL_FILE = "hermes_journal.json";
+function loadJournal() {
+  if (!existsSync(JOURNAL_FILE)) return [];
+  try { return JSON.parse(readFileSync(JOURNAL_FILE, "utf8")); } catch { return []; }
+}
+function saveJournal(j) { writeFileSync(JOURNAL_FILE, JSON.stringify(j, null, 2)); }
+
+function journalEntry(symbol, price, indicators, slPct, tp1Pct, tp2Pct) {
+  const j = loadJournal();
+  const id = `H-${Date.now()}`;
+  const uaeHour = parseInt(new Date().toLocaleString("en-GB", { timeZone: "Asia/Dubai", hour: "numeric", hour12: false }));
+  j.push({
+    id, symbol, status: "open",
+    entryTime: new Date().toISOString(), uaeHour,
+    price,
+    // All entry indicators — the learning data
+    ema9: indicators.ema9, ema21: indicators.ema21, ema50: indicators.ema50,
+    rsi: indicators.rsi, rsiPrev: indicators.rsiPrev, rsiPeak: indicators.rsiPeak,
+    bearVotes: indicators.bearVotes, volRatio: indicators.volRatio,
+    atr14: indicators.atr14, atrPct: indicators.atrPct,
+    confidence: indicators.confidence,
+    // Risk levels used
+    slPct: +(slPct * 100).toFixed(3),
+    tp1Pct: +(tp1Pct * 100).toFixed(3),
+    tp2Pct: +(tp2Pct * 100).toFixed(3),
+    // Outcome (filled at close)
+    exitTime: null, exitPrice: null, exitReason: null, pnl: null, tp1Hit: false,
+  });
+  saveJournal(j);
+  console.log(`  📓 Journal entry created: ${id} | conf=${indicators.confidence}/100 | ATR=${indicators.atrPct?.toFixed(2)}%`);
+  return id;
+}
+
+function journalClose(journalId, exitPrice, exitReason, pnl, tp1Hit) {
+  const j = loadJournal();
+  const entry = j.find(e => e.id === journalId);
+  if (!entry) return;
+  entry.status    = "closed";
+  entry.exitTime  = new Date().toISOString();
+  entry.exitPrice = exitPrice;
+  entry.exitReason = exitReason;
+  entry.pnl       = pnl;
+  entry.tp1Hit    = tp1Hit;
+  saveJournal(j);
+}
+
+// ─── Hermes Weekly Self-Analysis ─────────────────────────────────────────────
+// Call manually or schedule: reads journal → prints which conditions correlate with wins.
+function hermesAnalysis() {
+  const j = loadJournal().filter(e => e.status === "closed" && e.pnl !== null);
+  if (j.length < 5) { console.log("  📊 Not enough closed Hermes trades for analysis yet (need 5+)"); return; }
+
+  const wins  = j.filter(e => e.pnl > 0);
+  const loses = j.filter(e => e.pnl <= 0);
+  const avg   = (arr, field) => arr.length ? arr.reduce((s, e) => s + (e[field]||0), 0) / arr.length : 0;
+
+  console.log(`\n  ── Hermes Journal Analysis (${j.length} closed trades) ──`);
+  console.log(`  Win rate  : ${Math.round(wins.length/j.length*100)}% (${wins.length}W / ${loses.length}L)`);
+  console.log(`  Total P&L : $${j.reduce((s,e)=>s+e.pnl,0).toFixed(2)}`);
+  console.log(`  Avg P&L   : $${(j.reduce((s,e)=>s+e.pnl,0)/j.length).toFixed(2)}/trade`);
+  console.log(`\n  Winners vs Losers:`);
+  for (const field of ["confidence","bearVotes","rsiPeak","volRatio","atrPct","uaeHour"]) {
+    const wAvg = avg(wins, field).toFixed(2), lAvg = avg(loses, field).toFixed(2);
+    const edge = parseFloat(wAvg) > parseFloat(lAvg) ? "↑ higher = better" : "↓ lower = better";
+    console.log(`  ${field.padEnd(12)}: wins=${wAvg}  losses=${lAvg}  (${edge})`);
+  }
+  console.log(`\n  Best UAE hours: ${[...new Set(wins.map(e=>e.uaeHour))].sort((a,b)=>a-b).join(", ")}`);
+  console.log(`  Worst UAE hours: ${[...new Set(loses.map(e=>e.uaeHour))].sort((a,b)=>a-b).join(", ")}`);
 }
 
 // ─── Bybit Execution ──────────────────────────────────────────────────────────
 
 function signBybit(timestamp, body) {
+  // Bybit v5 POST signing: timestamp + apiKey + recvWindow + body
   return crypto.createHmac("sha256", CONFIG.bybit.secretKey)
-    .update(`${timestamp}5000${body}`).digest("hex");
+    .update(`${timestamp}${CONFIG.bybit.apiKey}5000${body}`).digest("hex");
 }
 
-async function placeBybitOrder(symbol, side, sizeUSD, price, mode = "spot") {
+// Price tick precision per asset (coarse enough to satisfy BOTH spot and linear tick sizes).
+// Used to round the native stop-loss trigger price so Bybit accepts it.
+const PRICE_DECIMALS = { NEARUSDT: 3, SOLUSDT: 2, ETHUSDT: 2, BTCUSDT: 1, TRXUSDT: 4 };
+
+// Retry wrapper.
+//  - On a Bybit logic error WHILE a native SL was attached: retry once WITHOUT the SL
+//    so a rejected stop-loss parameter can never block the actual entry. The software-side
+//    SL remains the backstop in that case.
+//  - On network/JSON errors: retry after 2s (not on Bybit logic errors).
+async function placeBybitOrder(symbol, side, sizeUSD, price, mode = "spot", slPrice = null, reduceOnly = false, tpPrice = null) {
+  // "Protection" = native SL and/or TP attached to the entry order (linear only).
+  let useProt = (slPrice !== null || tpPrice !== null) && !reduceOnly;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      return await _placeBybitOrder(symbol, side, sizeUSD, price, mode, useProt ? slPrice : null, reduceOnly, useProt ? tpPrice : null);
+    } catch (err) {
+      const isNetworkErr = !err.message.startsWith("Bybit error");
+      if (useProt && !isNetworkErr) {
+        // Native TP/SL params rejected — drop them and retry so the entry still fills.
+        console.log(`  ⚠️  Native TP/SL rejected (${err.message.slice(0,70)}). Retrying WITHOUT them — software exits still active.`);
+        useProt = false;
+        continue;
+      }
+      if (isNetworkErr && attempt < 3) {
+        console.log(`  ⚠️  Order attempt ${attempt} failed (${err.message.slice(0,60)}) — retrying in 2s...`);
+        await new Promise(r => setTimeout(r, 2000));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+async function _placeBybitOrder(symbol, side, sizeUSD, price, mode = "spot", slPrice = null, reduceOnly = false, tpPrice = null) {
   const timestamp = Date.now().toString();
+  const dp    = PRICE_DECIMALS[symbol] ?? 2;
+  const slStr = slPrice !== null ? slPrice.toFixed(dp) : null;
+  const tpStr = tpPrice !== null ? tpPrice.toFixed(dp) : null;
 
   let body;
   if (mode === "linear") {
-    // Perpetual futures — true shorts possible, qty in contracts (USD value / price)
-    const qty = (sizeUSD / price).toFixed(3);
+    // Perpetual futures — qty step per asset (from Bybit instrument info):
+    //   NEAR=0.1(1dp), SOL=0.1(1dp), ETH=0.01(2dp), BTC=0.001(3dp)
+    const LINEAR_DECIMALS = { NEARUSDT: 1, SOLUSDT: 1, ETHUSDT: 2, BTCUSDT: 3 };
+    const qtyDecimals = LINEAR_DECIMALS[symbol] ?? 2;
+    const qty = (sizeUSD / price).toFixed(qtyDecimals);
     body = JSON.stringify({
       category:    "linear",
       symbol,
@@ -369,19 +704,45 @@ async function placeBybitOrder(symbol, side, sizeUSD, price, mode = "spot") {
       orderType:   "Market",
       qty,
       timeInForce: "IOC",
-      reduceOnly:  false,
+      reduceOnly,       // true for closes — can only reduce a position, never flip it
       positionIdx: 0,   // one-way mode
+      // Native server-side TP/SL — fire even if the bot/PC is offline.
+      // tpslMode "Full" = whole position; triggered on Last price.
+      // (Only attached on entries; closes pass reduceOnly + no TP/SL.)
+      ...((slStr || tpStr) && !reduceOnly ? {
+        ...(slStr ? { stopLoss: slStr, slTriggerBy: "LastPrice" } : {}),
+        ...(tpStr ? { takeProfit: tpStr, tpTriggerBy: "LastPrice" } : {}),
+        tpslMode: "Full",
+      } : {}),
     });
   } else {
-    // Spot — buy/sell tokens
-    const quantity = (sizeUSD / price).toFixed(6);
-    body = JSON.stringify({
-      category:  "spot",
-      symbol,
-      side:      side === "buy" ? "Buy" : "Sell",
-      orderType: "Market",
-      qty:       quantity,
-    });
+    // Spot orders:
+    //   BUY  — pass USDT amount with marketUnit:"quoteCoin" (works for all assets uniformly)
+    //   SELL — pass base token qty using per-asset decimal precision
+    //          NEAR=0.01(2dp), SOL=0.0001(4dp), ETH=0.00001(5dp), BTC=0.000001(6dp)
+    const SPOT_DECIMALS = { NEARUSDT: 2, SOLUSDT: 4, ETHUSDT: 5, BTCUSDT: 6, TRXUSDT: 2 };
+    if (side === "buy") {
+      body = JSON.stringify({
+        category:   "spot",
+        symbol,
+        side:       "Buy",
+        orderType:  "Market",
+        qty:        sizeUSD.toFixed(2),   // USDT amount
+        marketUnit: "quoteCoin",          // tells Bybit qty is in quote (USDT)
+        // Native server-side stop-loss on the spot holding — fires even if PC is offline.
+        ...(slStr ? { stopLoss: slStr, slOrderType: "Market" } : {}),
+      });
+    } else {
+      const decimals = SPOT_DECIMALS[symbol] ?? 4;
+      const tokenQty = (sizeUSD / price).toFixed(decimals);
+      body = JSON.stringify({
+        category:  "spot",
+        symbol,
+        side:      "Sell",
+        orderType: "Market",
+        qty:       tokenQty,             // base token amount to sell
+      });
+    }
   }
   const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/create`, {
     method: "POST",
@@ -394,9 +755,365 @@ async function placeBybitOrder(symbol, side, sizeUSD, price, mode = "spot") {
     },
     body,
   });
-  const data = await res.json();
-  if (data.retCode !== 0) throw new Error(`Bybit error: ${data.retMsg}`);
+  const raw = await res.text();
+  let data;
+  try { data = JSON.parse(raw); }
+  catch { throw new Error(`Bybit non-JSON response (HTTP ${res.status}): ${raw.slice(0,120)}`); }
+  if (data.retCode !== 0) throw new Error(`Bybit error ${data.retCode}: ${data.retMsg}`);
   return data.result;
+}
+
+// ─── Spot stop-loss (separate conditional order) ─────────────────────────────
+// A spot market BUY sized in USDT can't carry an attached SL (Bybit error 170130 —
+// it doesn't know the base qty until fill). So we place a standalone server-side
+// conditional STOP-MARKET sell that Bybit triggers if price falls to the trigger,
+// protecting the holding even when the bot/PC is offline.
+const SPOT_QTY_DECIMALS = { NEARUSDT: 2, SOLUSDT: 4, ETHUSDT: 5, BTCUSDT: 6, TRXUSDT: 2 };
+
+async function placeSpotStopLoss(symbol, baseQty, triggerPrice) {
+  const timestamp = Date.now().toString();
+  const trig = triggerPrice.toFixed(PRICE_DECIMALS[symbol] ?? 2);
+  // Floor the qty to the asset step so we never try to sell more than we hold.
+  const dec  = SPOT_QTY_DECIMALS[symbol] ?? 4;
+  const qty  = (Math.floor(baseQty * 10 ** dec) / 10 ** dec).toFixed(dec);
+  const body = JSON.stringify({
+    category:         "spot",
+    symbol,
+    side:             "Sell",
+    orderType:        "Market",
+    qty,
+    triggerPrice:     trig,
+    triggerDirection: 2,            // 2 = trigger when last price FALLS to trigger
+    orderFilter:      "StopOrder",
+    marketUnit:       "baseCoin",
+  });
+  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/create`, {
+    method: "POST",
+    headers: {
+      "Content-Type":      "application/json",
+      "X-BAPI-API-KEY":    CONFIG.bybit.apiKey,
+      "X-BAPI-SIGN":       signBybit(timestamp, body),
+      "X-BAPI-TIMESTAMP":  timestamp,
+      "X-BAPI-RECV-WINDOW":"5000",
+    },
+    body,
+  });
+  const data = await res.json();
+  if (data.retCode !== 0) throw new Error(`Bybit error ${data.retCode}: ${data.retMsg}`);
+  return data.result.orderId;
+}
+
+// Spot take-profit — a standalone conditional STOP-MARKET sell that triggers when
+// price RISES to the target (triggerDirection 1). Mirrors placeSpotStopLoss; gives
+// offline profit capture for spot longs whose live exit is RSI-based (no fixed price).
+async function placeSpotTakeProfit(symbol, baseQty, triggerPrice) {
+  const timestamp = Date.now().toString();
+  const trig = triggerPrice.toFixed(PRICE_DECIMALS[symbol] ?? 2);
+  const dec  = SPOT_QTY_DECIMALS[symbol] ?? 4;
+  const qty  = (Math.floor(baseQty * 10 ** dec) / 10 ** dec).toFixed(dec);
+  const body = JSON.stringify({
+    category:         "spot",
+    symbol,
+    side:             "Sell",
+    orderType:        "Market",
+    qty,
+    triggerPrice:     trig,
+    triggerDirection: 1,            // 1 = trigger when last price RISES to trigger
+    orderFilter:      "StopOrder",
+    marketUnit:       "baseCoin",
+  });
+  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/create`, {
+    method: "POST",
+    headers: {
+      "Content-Type":      "application/json",
+      "X-BAPI-API-KEY":    CONFIG.bybit.apiKey,
+      "X-BAPI-SIGN":       signBybit(timestamp, body),
+      "X-BAPI-TIMESTAMP":  timestamp,
+      "X-BAPI-RECV-WINDOW":"5000",
+    },
+    body,
+  });
+  const data = await res.json();
+  if (data.retCode !== 0) throw new Error(`Bybit error ${data.retCode}: ${data.retMsg}`);
+  return data.result.orderId;
+}
+
+// Cancel a dangling spot conditional order (stop OR take-profit) before selling.
+// Returns true if cancelled, false if it couldn't be (e.g. already triggered/gone).
+async function cancelSpotConditional(symbol, orderId) {
+  if (!orderId) return false;
+  try {
+    const timestamp = Date.now().toString();
+    const body = JSON.stringify({ category: "spot", symbol, orderId, orderFilter: "StopOrder" });
+    const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/cancel`, {
+      method: "POST",
+      headers: {
+        "Content-Type":      "application/json",
+        "X-BAPI-API-KEY":    CONFIG.bybit.apiKey,
+        "X-BAPI-SIGN":       signBybit(timestamp, body),
+        "X-BAPI-TIMESTAMP":  timestamp,
+        "X-BAPI-RECV-WINDOW":"5000",
+      },
+      body,
+    });
+    const data = await res.json();
+    return data.retCode === 0;
+  } catch { return false; }
+}
+
+// Read the free wallet balance of a coin (e.g. "SOL"). Returns a Number, or null on error.
+// Used by the VWAP exit to confirm tokens are actually gone before marking a position closed.
+async function getSpotBalance(coin) {
+  try {
+    const timestamp = Date.now().toString();
+    const params = `accountType=UNIFIED&coin=${coin}`;
+    const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/account/wallet-balance?${params}`, {
+      headers: {
+        "X-BAPI-API-KEY":    CONFIG.bybit.apiKey,
+        "X-BAPI-SIGN":       signBybit(timestamp, params),
+        "X-BAPI-TIMESTAMP":  timestamp,
+        "X-BAPI-RECV-WINDOW":"5000",
+      },
+    });
+    const data = await res.json();
+    const c = data.result?.list?.[0]?.coin?.find((x) => x.coin === coin);
+    return c ? parseFloat(c.walletBalance) : 0;
+  } catch { return null; }
+}
+
+// Market-sell an explicit base-coin quantity. The VWAP exit uses this to sell exactly
+// what's HELD — avoiding the size/price mismatch that oversells at a loss (failed sell →
+// orphan) and leaves profit tokens behind at a gain (dust residual).
+async function sellSpotHolding(symbol, baseQty) {
+  const timestamp = Date.now().toString();
+  const dec  = SPOT_QTY_DECIMALS[symbol] ?? 4;
+  const qty  = (Math.floor(baseQty * 10 ** dec) / 10 ** dec).toFixed(dec);
+  const body = JSON.stringify({ category: "spot", symbol, side: "Sell", orderType: "Market", qty, marketUnit: "baseCoin" });
+  const res  = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/create`, {
+    method: "POST",
+    headers: {
+      "Content-Type":      "application/json",
+      "X-BAPI-API-KEY":    CONFIG.bybit.apiKey,
+      "X-BAPI-SIGN":       signBybit(timestamp, body),
+      "X-BAPI-TIMESTAMP":  timestamp,
+      "X-BAPI-RECV-WINDOW":"5000",
+    },
+    body,
+  });
+  const data = await res.json();
+  if (data.retCode !== 0) throw new Error(`Bybit error ${data.retCode}: ${data.retMsg}`);
+  return data.result;
+}
+
+// ─── Limit-order helpers (for maker-fee dip-buyer entries) ───────────────────
+
+// Place a spot LIMIT BUY below the current market price.
+// A buy-limit below market goes into the order book (maker) → ~0.02% Bybit spot maker fee.
+// qty is in base coin (e.g. BTC), price is the limit price in USDT.
+async function placeLimitBuySpot(symbol, sizeUSD, limitPrice) {
+  const timestamp = Date.now().toString();
+  const pDec = PRICE_DECIMALS[symbol] ?? 2;
+  const qDec = SPOT_QTY_DECIMALS[symbol] ?? 4;
+  // Floor qty to avoid overshooting when rounded up
+  const baseQty = (Math.floor(sizeUSD / limitPrice * 10 ** qDec) / 10 ** qDec).toFixed(qDec);
+  const priceStr = limitPrice.toFixed(pDec);
+  const body = JSON.stringify({
+    category:    "spot",
+    symbol,
+    side:        "Buy",
+    orderType:   "Limit",
+    qty:         baseQty,      // base coin amount
+    price:       priceStr,     // limit price in USDT
+    timeInForce: "GTC",        // Good Till Cancelled — stays in book until filled or cancelled
+  });
+  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/create`, {
+    method: "POST",
+    headers: {
+      "Content-Type":      "application/json",
+      "X-BAPI-API-KEY":    CONFIG.bybit.apiKey,
+      "X-BAPI-SIGN":       signBybit(timestamp, body),
+      "X-BAPI-TIMESTAMP":  timestamp,
+      "X-BAPI-RECV-WINDOW":"5000",
+    },
+    body,
+  });
+  const data = await res.json();
+  if (data.retCode !== 0) throw new Error(`Bybit error ${data.retCode}: ${data.retMsg}`);
+  return data.result; // { orderId, ... }
+}
+
+// Set cross-margin leverage on a linear (perpetual) symbol before placing an order.
+// Must be called once per symbol each session (Bybit persists the setting).
+async function setBybitLeverage(symbol, leverage) {
+  const timestamp = Date.now().toString();
+  const lev = String(leverage);
+  const body = JSON.stringify({
+    category: "linear", symbol,
+    buyLeverage: lev, sellLeverage: lev,
+  });
+  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/set-leverage`, {
+    method: "POST",
+    headers: {
+      "Content-Type":      "application/json",
+      "X-BAPI-API-KEY":    CONFIG.bybit.apiKey,
+      "X-BAPI-SIGN":       signBybit(timestamp, body),
+      "X-BAPI-TIMESTAMP":  timestamp,
+      "X-BAPI-RECV-WINDOW":"5000",
+    },
+    body,
+  });
+  const data = await res.json();
+  // retCode 110043 = "leverage not modified" (already set) — treat as success
+  if (data.retCode !== 0 && data.retCode !== 110043)
+    throw new Error(`Bybit set-leverage error ${data.retCode}: ${data.retMsg}`);
+  return true;
+}
+
+// Place a LINEAR (perpetual futures) LIMIT BUY below market with native SL attached.
+// qty = (sizeUSD × leverage) / limitPrice  — controls 2× the margin in notional.
+// A limit below market = maker order = ~0.02% fee on Bybit futures.
+async function placeLimitBuyLinear(symbol, sizeUSD, leverage, limitPrice, slPrice, tpPrice = null) {
+  const timestamp = Date.now().toString();
+  const dp    = PRICE_DECIMALS[symbol] ?? 2;
+  const notional = sizeUSD * leverage;
+  // Qty step per symbol (from Bybit instrument info):
+  const LINEAR_DECIMALS = { NEARUSDT: 1, SOLUSDT: 1, ETHUSDT: 2, BTCUSDT: 3, TRXUSDT: 0 };
+  const qDec = LINEAR_DECIMALS[symbol] ?? 2;
+  const qty  = (Math.floor(notional / limitPrice * 10 ** qDec) / 10 ** qDec).toFixed(qDec);
+  const body = JSON.stringify({
+    category:    "linear",
+    symbol,
+    side:        "Buy",
+    orderType:   "Limit",
+    qty,
+    price:       limitPrice.toFixed(dp),
+    timeInForce: "GTC",
+    positionIdx: 0,                        // one-way mode
+    // Native server-side SL + TP fire even if bot/PC is offline (V2 exchange-native exits)
+    ...(slPrice ? {
+      stopLoss:    slPrice.toFixed(dp),
+      slTriggerBy: "LastPrice",
+      tpslMode:    "Full",
+    } : {}),
+    ...(tpPrice ? {
+      takeProfit:    tpPrice.toFixed(dp),
+      tpTriggerBy:   "LastPrice",
+      tpslMode:      "Full",
+    } : {}),
+  });
+  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/create`, {
+    method: "POST",
+    headers: {
+      "Content-Type":      "application/json",
+      "X-BAPI-API-KEY":    CONFIG.bybit.apiKey,
+      "X-BAPI-SIGN":       signBybit(timestamp, body),
+      "X-BAPI-TIMESTAMP":  timestamp,
+      "X-BAPI-RECV-WINDOW":"5000",
+    },
+    body,
+  });
+  const data = await res.json();
+  if (data.retCode !== 0) throw new Error(`Bybit error ${data.retCode}: ${data.retMsg}`);
+  return data.result; // { orderId, ... }
+}
+
+// Place a LINEAR (perpetual futures) LIMIT SELL above market — SHORT entry with native SL.
+// side="Sell" + limit ABOVE market = maker order (sits in book, waits for price to push up).
+// slPrice = entry + 4×ATR (stop ABOVE entry for a short).
+async function placeLimitSellLinear(symbol, sizeUSD, leverage, limitPrice, slPrice, tpPrice = null) {
+  const timestamp = Date.now().toString();
+  const dp    = PRICE_DECIMALS[symbol] ?? 2;
+  const notional = sizeUSD * leverage;
+  const LINEAR_DECIMALS = { NEARUSDT: 1, SOLUSDT: 1, ETHUSDT: 2, BTCUSDT: 3, TRXUSDT: 0 };
+  const qDec = LINEAR_DECIMALS[symbol] ?? 2;
+  const qty  = (Math.floor(notional / limitPrice * 10 ** qDec) / 10 ** qDec).toFixed(qDec);
+  const body = JSON.stringify({
+    category:    "linear",
+    symbol,
+    side:        "Sell",          // SHORT entry
+    orderType:   "Limit",
+    qty,
+    price:       limitPrice.toFixed(dp),
+    timeInForce: "GTC",
+    positionIdx: 0,               // one-way mode
+    // Native server-side SL + TP (V2 exchange-native exits)
+    ...(slPrice ? {
+      stopLoss:    slPrice.toFixed(dp),
+      slTriggerBy: "LastPrice",
+      tpslMode:    "Full",
+    } : {}),
+    ...(tpPrice ? {
+      takeProfit:    tpPrice.toFixed(dp),
+      tpTriggerBy:   "LastPrice",
+      tpslMode:      "Full",
+    } : {}),
+  });
+  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/create`, {
+    method: "POST",
+    headers: {
+      "Content-Type":      "application/json",
+      "X-BAPI-API-KEY":    CONFIG.bybit.apiKey,
+      "X-BAPI-SIGN":       signBybit(timestamp, body),
+      "X-BAPI-TIMESTAMP":  timestamp,
+      "X-BAPI-RECV-WINDOW":"5000",
+    },
+    body,
+  });
+  const data = await res.json();
+  if (data.retCode !== 0) throw new Error(`Bybit error ${data.retCode}: ${data.retMsg}`);
+  return data.result; // { orderId, ... }
+}
+
+// Query the status of an order (checks history for closed orders too).
+// Returns { orderStatus, avgPrice, cumExecQty, cumExecValue } or null if not found.
+async function queryOrderStatus(symbol, orderId, category = "spot") {
+  try {
+    const timestamp = Date.now().toString();
+    // Check open orders first (realtime), then history
+    for (const endpoint of ["/v5/order/realtime", "/v5/order/history"]) {
+      const params = `category=${category}&symbol=${symbol}&orderId=${orderId}`;
+      const res = await fetch(`${CONFIG.bybit.baseUrl}${endpoint}?${params}`, {
+        headers: {
+          "X-BAPI-API-KEY":    CONFIG.bybit.apiKey,
+          "X-BAPI-SIGN":       signBybit(timestamp, params),
+          "X-BAPI-TIMESTAMP":  timestamp,
+          "X-BAPI-RECV-WINDOW":"5000",
+        },
+      });
+      const data = await res.json();
+      if (data.retCode === 0 && data.result?.list?.length > 0) {
+        const o = data.result.list[0];
+        return {
+          orderStatus:  o.orderStatus,
+          avgPrice:     parseFloat(o.avgPrice || "0"),
+          cumExecQty:   parseFloat(o.cumExecQty || "0"),
+          cumExecValue: parseFloat(o.cumExecValue || "0"),
+        };
+      }
+    }
+    return null;
+  } catch { return null; }
+}
+
+// Cancel an order by orderId — works for both spot and linear.
+async function cancelSpotOrder(symbol, orderId, category = "spot") {
+  try {
+    const timestamp = Date.now().toString();
+    const body = JSON.stringify({ category, symbol, orderId });
+    const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/cancel`, {
+      method: "POST",
+      headers: {
+        "Content-Type":      "application/json",
+        "X-BAPI-API-KEY":    CONFIG.bybit.apiKey,
+        "X-BAPI-SIGN":       signBybit(timestamp, body),
+        "X-BAPI-TIMESTAMP":  timestamp,
+        "X-BAPI-RECV-WINDOW":"5000",
+      },
+      body,
+    });
+    const data = await res.json();
+    return data.retCode === 0;
+  } catch { return false; }
 }
 
 // ─── CSV Trade Log ────────────────────────────────────────────────────────────
@@ -444,25 +1161,28 @@ function hasOpenPosition(symbol) {
 // Universal position recorder — used by both Hermes and VWAP
 // Hermes shorts: full TP/SL tracking
 // VWAP trades: recorded so conflict guard blocks opposite signals on same asset
-function openPositionRecord(symbol, side, entry, tradeSize, strategy, orderId) {
+function openPositionRecord(symbol, side, entry, tradeSize, strategy, orderId, vwapSlPct = 0.003, slOrderId = null, tpOrderId = null) {
   const positions = loadPositions();
   const filtered  = positions.filter((p) => p.symbol !== symbol || p.status !== "open");
-  const isHermesStrat = strategy === "hermes_v03" || strategy === "hermes_v04" || strategy === "hermes_v05";
+  const isHermesStrat = strategy === "hermes_v03" || strategy === "hermes_v04" || strategy === "hermes_v05" || strategy === "hermes_v06";
 
   filtered.push({
     symbol,
     side,
     strategy,
     entry,
-    tp1:      isHermesStrat ? +(entry * (1 - 0.015)).toFixed(6) : null,
-    tp2:      isHermesStrat ? +(entry * (1 - 0.030)).toFixed(6) : null,
-    sl:       isHermesStrat ? +(entry * (1 + 0.015)).toFixed(6) : null,
-    slBE:     null,
-    size:     tradeSize,
-    tp1Hit:   false,
-    status:   "open",
-    openTime: new Date().toISOString(),
-    orderId:  orderId || null,
+    tp1:       isHermesStrat ? +(entry * (1 - 0.015)).toFixed(6) : null,
+    tp2:       isHermesStrat ? +(entry * (1 - 0.030)).toFixed(6) : null,
+    sl:        isHermesStrat ? +(entry * (1 + 0.015)).toFixed(6) : null,
+    slBE:      null,
+    slPct:     isHermesStrat ? null : vwapSlPct,  // per-asset SL % for VWAP exits
+    slOrderId: slOrderId || null,                 // Bybit conditional stop order id (spot)
+    tpOrderId: tpOrderId || null,                 // Bybit conditional take-profit order id (spot)
+    size:      tradeSize,
+    tp1Hit:    false,
+    status:    "open",
+    openTime:  new Date().toISOString(),
+    orderId:   orderId || null,
   });
   savePositions(filtered);
 
@@ -485,18 +1205,10 @@ async function checkHermesPositions(log) {
 
   console.log(`\n─── Position Manager (${open.length} open) ─────────────────────`);
 
-  // Auto-expire VWAP positions after 4 hours (bot doesn't manage their exits)
-  for (const pos of open) {
-    const isVwap = !pos.tp1 && !pos.tp2;
-    if (isVwap) {
-      const ageHrs = (Date.now() - new Date(pos.openTime).getTime()) / 3600000;
-      if (ageHrs >= 4) {
-        pos.status = "closed"; pos.closeReason = "vwap_expiry"; pos.closeTime = new Date().toISOString();
-        console.log(`  ⏱️  VWAP ${pos.symbol} position expired after ${ageHrs.toFixed(1)}h — slot freed`);
-      }
-    }
-  }
-  savePositions(open.map(p => p)); // save expiry updates before Hermes checks
+  // NOTE: VWAP positions (no tp1/tp2) are owned entirely by checkVwapPositions(),
+  // which handles RSI exit, stop-loss, trailing BE, AND 4h expiry — and crucially
+  // cancels the server-side stop order before selling. We must NOT close them here,
+  // or that cleanup is skipped and a dangling stop order is left on the exchange.
 
   for (const pos of open) {
     // Fetch current price (use 5m for tight exit tracking)
@@ -510,22 +1222,29 @@ async function checkHermesPositions(log) {
       continue;
     }
 
+    // VWAP positions have sl=null — skip here, handled by checkVwapPositions
+    if (pos.sl === null && pos.tp1 === null) {
+      console.log(`  ⏭️  ${pos.symbol} (VWAP) — exit managed by VWAP Exit Manager`);
+      continue;
+    }
+
     const activeSL = pos.tp1Hit ? pos.slBE : pos.sl;
     const pct = ((pos.entry - price) / pos.entry * 100).toFixed(2);
     console.log(`  ${pos.symbol}: entry=$${pos.entry} now=$${price.toFixed(4)} P&L=${pct}% | SL=$${activeSL} TP1=$${pos.tp1}${pos.tp1Hit?" ✅":""} TP2=$${pos.tp2}`);
 
     // ── SL Hit ──────────────────────────────────────────────────────────────
-    if (price >= activeSL) {
+    if (activeSL !== null && price >= activeSL) {
       const pnl = pos.tp1Hit
         ? (pos.entry - activeSL) / pos.entry * (pos.size * 0.5)
         : (pos.entry - activeSL) / pos.entry * pos.size;
       console.log(`  🛑 SL HIT @ $${price.toFixed(4)} | PnL: $${pnl.toFixed(2)}`);
       if (!CONFIG.paperTrading) {
-        try { await placeBybitOrder(pos.symbol, "buy", pos.tp1Hit ? pos.size*0.5 : pos.size, price, "linear"); } catch {}
+        try { await placeBybitOrder(pos.symbol, "buy", pos.tp1Hit ? pos.size*0.5 : pos.size, price, "linear", null, true); } catch {}
       }
       writeTradeCsv({ symbol: pos.symbol, strategy: "hermes_v03", side: "buy", price, tradeSize: pos.tp1Hit ? pos.size*0.5 : pos.size, mode: CONFIG.paperTrading?"PAPER":"LIVE", signal: `EXIT_SL pnl=$${pnl.toFixed(2)}` });
       pos.status = "closed"; pos.closeReason = "stop_loss"; pos.closePrice = price; pos.closeTime = new Date().toISOString(); pos.pnl = pnl;
       log.trades.push({ timestamp: new Date().toISOString(), symbol: pos.symbol, side: "buy", price, orderPlaced: true, reason: "hermes_sl" });
+      if (pos.journalId) journalClose(pos.journalId, price, "stop_loss", pnl, pos.tp1Hit);
       await tgSL(pos.symbol, pos.entry, price.toFixed(4), pnl, pos.tp1Hit);
 
     // ── TP1 Hit (partial exit 50%) ───────────────────────────────────────────
@@ -533,7 +1252,7 @@ async function checkHermesPositions(log) {
       const pnl1 = (pos.entry - pos.tp1) / pos.entry * (pos.size * 0.5);
       console.log(`  ✅ TP1 HIT @ $${price.toFixed(4)} — exiting 50% | Locked: +$${pnl1.toFixed(2)} | SL→ breakeven`);
       if (!CONFIG.paperTrading) {
-        try { await placeBybitOrder(pos.symbol, "buy", pos.size * 0.5, price, "linear"); } catch {}
+        try { await placeBybitOrder(pos.symbol, "buy", pos.size * 0.5, price, "linear", null, true); } catch {}
       }
       writeTradeCsv({ symbol: pos.symbol, strategy: "hermes_v03", side: "buy", price, tradeSize: pos.size*0.5, mode: CONFIG.paperTrading?"PAPER":"LIVE", signal: `EXIT_TP1 locked=+$${pnl1.toFixed(2)}` });
       pos.tp1Hit = true;
@@ -547,11 +1266,12 @@ async function checkHermesPositions(log) {
       const pnl1 = (pos.entry - pos.tp1) / pos.entry * (pos.size * 0.5);
       console.log(`  🏆 TP2 HIT @ $${price.toFixed(4)} — full exit | Total PnL: +$${(pnl1+pnl2).toFixed(2)}`);
       if (!CONFIG.paperTrading) {
-        try { await placeBybitOrder(pos.symbol, "buy", pos.size * 0.5, price, "linear"); } catch {}
+        try { await placeBybitOrder(pos.symbol, "buy", pos.size * 0.5, price, "linear", null, true); } catch {}
       }
       writeTradeCsv({ symbol: pos.symbol, strategy: "hermes_v03", side: "buy", price, tradeSize: pos.size*0.5, mode: CONFIG.paperTrading?"PAPER":"LIVE", signal: `EXIT_TP2 total=+$${(pnl1+pnl2).toFixed(2)}` });
       pos.status = "closed"; pos.closeReason = "take_profit_full"; pos.closePrice = price; pos.closeTime = new Date().toISOString(); pos.pnl = pnl1+pnl2;
       log.trades.push({ timestamp: new Date().toISOString(), symbol: pos.symbol, side: "buy", price, orderPlaced: true, reason: "hermes_tp2" });
+      if (pos.journalId) journalClose(pos.journalId, price, "take_profit_full", pnl1+pnl2, true);
       await tgTP2(pos.symbol, pos.entry, price.toFixed(4), pnl1+pnl2);
     }
   }
@@ -562,6 +1282,9 @@ async function checkHermesPositions(log) {
 // ─── Process one asset ────────────────────────────────────────────────────────
 
 async function processAsset(asset, log) {
+  // Route dip-buyer to its own self-contained handler
+  if (asset.strategy === "dip_buyer") return await processDipBuyer(asset, log);
+
   console.log(`\n─── ${asset.symbol} [${asset.strategy}] ─────────────────────`);
 
   // Hermes uses 1H candles for quality signals; VWAP uses 5m
@@ -577,9 +1300,18 @@ async function processAsset(asset, log) {
   const price   = candles[candles.length - 1].close;
   console.log(`  Price: $${price.toFixed(4)} [${tf}]`);
 
+  // ── [v06] Fetch BTC 4H RSI for macro regime filter (Hermes only) ───────────
+  let btcRsi4h = null;
+  if (isHermes && asset.symbol !== "BTCUSDT") {
+    try {
+      const btcC4h = await fetchCandles("BTC-USDT", "4H", 20);
+      btcRsi4h = calcRSI(btcC4h.map(c => c.close), 14);
+    } catch { /* non-fatal */ }
+  }
+
   // Run the assigned strategy
   const result = isHermes
-    ? checkStratHermes(candles, asset.trendVote || 0)
+    ? checkStratHermes(candles, asset.trendVote ?? 8, btcRsi4h)
     : checkStratVwapRsi(candles);
 
   const ind = result.indicators || {};
@@ -611,7 +1343,7 @@ async function processAsset(asset, log) {
     console.log(`  📋 PAPER: Would ${result.side.toUpperCase()} $${tradeSize} of ${asset.symbol} @ $${price.toFixed(4)}`);
     writeTradeCsv({ symbol: asset.symbol, strategy: asset.strategy, side: result.side, price, tradeSize, mode: "PAPER", signal: result.reason });
     log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: result.side, price, orderPlaced: true, paper: true });
-    openPositionRecord(asset.symbol, result.side, price, tradeSize, asset.strategy, null);
+    openPositionRecord(asset.symbol, result.side, price, tradeSize, asset.strategy, null, asset.vwapSlPct);
     if (isHermes) {
       const tp1 = (price * 0.985).toFixed(4), tp2 = (price * 0.970).toFixed(4), sl = (price * 1.015).toFixed(4);
       await tgEntry(asset.symbol, result.side, price.toFixed(4), tradeSize, tp1, tp2, sl, "Hermes v05 [PAPER]");
@@ -621,15 +1353,57 @@ async function processAsset(asset, log) {
 
   // Live execution — Hermes=perpetual (true short), VWAP=spot (token buy/sell)
   const execMode = isHermes ? "linear" : "spot";
+
+  // ── [v06] ATR-adaptive SL/TP for Hermes; fixed % for VWAP ───────────────
+  const slPct   = isHermes
+    ? (result.atrSlPct  ?? 0.015)   // ATR-adaptive (from checkStratHermes)
+    : (asset.vwapSlPct  ?? 0.005);  // VWAP: per-asset fixed %
+  const tp1Pct  = isHermes ? (result.atrTp1Pct ?? 0.015) : slPct * 1;
+  const tp2Pct  = isHermes ? (result.atrTp2Pct ?? 0.030) : slPct * 3;
+
+  const slPrice  = isHermes ? price * (1 + slPct)  : price * (1 - slPct);
+  const tp1Price = isHermes ? price * (1 - tp1Pct) : price * (1 + tp1Pct);
+  const tp2Price = isHermes ? price * (1 - tp2Pct) : price * (1 + tp2Pct);
+  const dp       = PRICE_DECIMALS[asset.symbol] ?? 2;
+
+  if (isHermes) {
+    console.log(`  📐 v06 ATR levels: SL=+${(slPct*100).toFixed(2)}% ($${slPrice.toFixed(dp)}) | TP1=-${(tp1Pct*100).toFixed(2)}% ($${tp1Price.toFixed(dp)}) | TP2=-${(tp2Pct*100).toFixed(2)}% ($${tp2Price.toFixed(dp)}) | conf=${result.indicators?.confidence}/100`);
+  }
+
   try {
-    const order = await placeBybitOrder(asset.symbol, result.side, tradeSize, price, execMode);
-    console.log(`  ✅ ORDER PLACED: ${result.side.toUpperCase()} ${asset.symbol} [${execMode}] | ID: ${order.orderId}`);
-    writeTradeCsv({ symbol: asset.symbol, strategy: asset.strategy, side: result.side, price, tradeSize, orderId: order.orderId, mode: `LIVE-${execMode.toUpperCase()}`, signal: result.reason });
+    // Linear: TP+SL attach to the entry order. Spot: placed as separate conditional orders below.
+    const order = await placeBybitOrder(asset.symbol, result.side, tradeSize, price, execMode, isHermes ? slPrice : null, false, isHermes ? tp2Price : null);
+
+    // Spot long → place separate server-side conditional stop-sell + take-profit (offline protection)
+    let slOrderId = null, tpOrderId = null;
+    if (!isHermes && result.side === "buy") {
+      const baseQty = tradeSize / price;
+      try {
+        slOrderId = await placeSpotStopLoss(asset.symbol, baseQty, slPrice);
+        console.log(`  🛡️ Spot stop-loss order placed @ $${slPrice.toFixed(dp)} (id ${slOrderId})`);
+      } catch (e) {
+        console.log(`  ⚠️  Spot stop-loss not placed (${e.message.slice(0,60)}) — software SL still active`);
+      }
+      try {
+        tpOrderId = await placeSpotTakeProfit(asset.symbol, baseQty, tp2Price);
+        console.log(`  🎯 Spot take-profit order placed @ $${tp2Price.toFixed(dp)} (id ${tpOrderId})`);
+      } catch (e) {
+        console.log(`  ⚠️  Spot take-profit not placed (${e.message.slice(0,60)}) — software exit still active`);
+      }
+    }
+    console.log(`  ✅ ORDER PLACED: ${result.side.toUpperCase()} ${asset.symbol} [${execMode}] | ID: ${order.orderId}${isHermes ? ` | 🛡️ SL @ $${slPrice.toFixed(dp)} 🎯 TP2 @ $${tp2Price.toFixed(dp)}` : ""}`);
+    writeTradeCsv({ symbol: asset.symbol, strategy: "hermes_v06", side: result.side, price, tradeSize, orderId: order.orderId, mode: `LIVE-${execMode.toUpperCase()}`, signal: result.reason });
     log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: result.side, price, orderPlaced: true, orderId: order.orderId, execMode });
-    openPositionRecord(asset.symbol, result.side, price, tradeSize, asset.strategy, order.orderId);
+    openPositionRecord(asset.symbol, result.side, price, tradeSize, "hermes_v06", order.orderId, asset.vwapSlPct, slOrderId, tpOrderId);
     if (isHermes) {
-      const tp1 = (price * 0.985).toFixed(4), tp2 = (price * 0.970).toFixed(4), sl = (price * 1.015).toFixed(4);
-      await tgEntry(asset.symbol, result.side, price.toFixed(4), tradeSize, tp1, tp2, sl, "Hermes v05 [LIVE]");
+      // Write journal entry with full indicators
+      const jId = journalEntry(asset.symbol, price, result.indicators, slPct, tp1Pct, tp2Pct);
+      // Store journalId in position for close-time annotation
+      const positions = loadPositions();
+      const myPos = positions.find(p => p.symbol === asset.symbol && p.status === "open" && p.strategy === "hermes_v06");
+      if (myPos) { myPos.journalId = jId; savePositions(positions); }
+
+      await tgEntry(asset.symbol, result.side, price.toFixed(dp), tradeSize, tp1Price.toFixed(dp), tp2Price.toFixed(dp), slPrice.toFixed(dp), `Hermes v06 [LIVE] conf=${result.indicators?.confidence}/100`);
     }
     return true;
   } catch (err) {
@@ -641,7 +1415,12 @@ async function processAsset(asset, log) {
 // ─── Dual-scan: run Hermes(1H) on VWAP assets (NEAR + SOL) ──────────────────
 async function processHermesDualScan(asset, log) {
   const candles = await fetchCandles(asset.okx, CONFIG.hermesTimeframe, 100);
-  const result  = checkStratHermes(candles, asset.trendVote || 0);
+  // [v06] Fetch BTC 4H RSI for macro filter
+  let btcRsi4hDual = null;
+  if (asset.symbol !== "BTCUSDT") {
+    try { const bc = await fetchCandles("BTC-USDT", "4H", 20); btcRsi4hDual = calcRSI(bc.map(c => c.close), 14); } catch {}
+  }
+  const result  = checkStratHermes(candles, asset.trendVote ?? 8, btcRsi4hDual);
   if (!result.signal) {
     console.log(`  ⏸  ${asset.symbol} Hermes(${CONFIG.hermesTimeframe}) dual: ${result.reason}`);
     return false;
@@ -665,7 +1444,11 @@ async function processHermesDualScan(asset, log) {
     return true;
   }
   try {
-    const order = await placeBybitOrder(asset.symbol, result.side, tradeSize, price, "linear");
+    const slPrice = price * 1.015;  // Hermes short SL: 1.5% above entry
+    const tpPrice = price * 0.970;  // Hermes short TP: 3% below entry (full-exit target)
+    const dp = PRICE_DECIMALS[asset.symbol] ?? 2;
+    const order = await placeBybitOrder(asset.symbol, result.side, tradeSize, price, "linear", slPrice, false, tpPrice);
+    console.log(`  🛡️ native SL @ $${slPrice.toFixed(dp)} 🎯 TP @ $${tpPrice.toFixed(dp)}`);
     writeTradeCsv({ symbol: asset.symbol, strategy: "hermes_v05", side: result.side, price, tradeSize, orderId: order.orderId, mode: "LIVE-LINEAR", signal: result.reason });
     log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: result.side, price, orderPlaced: true, orderId: order.orderId, execMode: "linear" });
     openHermesPosition(asset.symbol, price, tradeSize, order.orderId);
@@ -686,7 +1469,7 @@ async function processHermesDualScan(asset, log) {
 async function checkVwapPositions(log) {
   const positions = loadPositions();
   const openVwap  = positions.filter(
-    (p) => p.status === "open" && p.tp1 === null  // VWAP has no tp1/tp2
+    (p) => p.status === "open" && p.strategy === "vwap_rsi3_ema8"  // dip_buyer has its own manager
   );
   if (!openVwap.length) return;
 
@@ -717,16 +1500,20 @@ async function checkVwapPositions(log) {
       console.log(`  🔒 Trailing stop activated — SL moved to breakeven $${pos.entry} (profit +${profitPct.toFixed(2)}%)`);
       await tg(`🔒 <b>VWAP trailing stop — ${pos.symbol}</b>\nProfit +${profitPct.toFixed(2)}% → SL moved to breakeven $${pos.entry}\nLetting winner run! 🚀`);
     }
-    const sl = pos.slBE ?? (pos.entry * (1 - 0.003)); // breakeven or 0.3% SL
+    const slPct = pos.slPct ?? 0.003; // per-asset SL % (ETH=0.7%, BTC=0.4%, others=0.3%)
+    const sl = pos.slBE ?? (pos.entry * (1 - slPct));
 
     console.log(`  ${pos.symbol}: entry=$${pos.entry} now=$${price.toFixed(4)} P&L=${pct.toFixed(2)}% | RSI3=${rsi3?.toFixed(1)} SL=$${sl.toFixed(4)}${pos.slBE?" [BE]":""}`);
 
     let exitReason = null;
 
-    // Exit 1: RSI(3) crosses above 50 — trend exhausted, take profit
-    if (rsi3 && rsi3Prev && rsi3Prev < 50 && rsi3 >= 50) {
-      exitReason = "rsi3_cross_50";
-      console.log(`  🎯 RSI(3) crossed 50 — taking profit @ $${price.toFixed(4)} | P&L: ${pct.toFixed(2)}%`);
+    // Exit 1: RSI(3) crosses above 65 — stronger momentum signal (was 50).
+    // At 50 crossover, bounce barely covers 0.2% round-trip fee.
+    // At 65+ the move is 0.5-1.0%, well above fee breakeven.
+    const RSI3_EXIT = 65;
+    if (rsi3 !== null && rsi3Prev !== null && rsi3Prev < RSI3_EXIT && rsi3 >= RSI3_EXIT) {
+      exitReason = `rsi3_cross_${RSI3_EXIT}`;
+      console.log(`  🎯 RSI(3) crossed ${RSI3_EXIT} — taking profit @ $${price.toFixed(4)} | P&L: ${pct.toFixed(2)}%`);
     }
     // Exit 2: stop loss hit (fixed 0.3% or breakeven after trailing)
     else if (price <= sl) {
@@ -743,16 +1530,50 @@ async function checkVwapPositions(log) {
     }
 
     if (exitReason) {
-      // Place real spot SELL to return tokens → USDT
+      // Place real spot SELL to return tokens → USDT.
+      // CRITICAL: only mark the position closed if the sell actually succeeded (or the
+      // tokens are confirmed gone). Marking closed after a FAILED sell orphans the tokens
+      // (untracked + unprotected) — that was the SOL double-holding bug.
+      let sellConfirmed = CONFIG.paperTrading;  // paper trading = nothing to sell
       if (!CONFIG.paperTrading) {
-        try {
-          await placeBybitOrder(pos.symbol, "sell", pos.size, price, "spot");
-          console.log(`  ✅ VWAP SELL placed — ${pos.size} USD of ${pos.symbol} sold`);
-        } catch (e) {
-          console.log(`  ❌ VWAP sell failed: ${e.message}`);
+        // Cancel dangling server-side stop + take-profit first so neither fires on tokens we're selling.
+        if (pos.slOrderId) {
+          const cancelled = await cancelSpotConditional(pos.symbol, pos.slOrderId);
+          console.log(`  🧹 Stop-loss order ${cancelled ? "cancelled" : "already gone/triggered"} (id ${pos.slOrderId})`);
+        }
+        if (pos.tpOrderId) {
+          const cancelled = await cancelSpotConditional(pos.symbol, pos.tpOrderId);
+          console.log(`  🧹 Take-profit order ${cancelled ? "cancelled" : "already gone/triggered"} (id ${pos.tpOrderId})`);
+        }
+        await new Promise((r) => setTimeout(r, 500));  // let cancelled balance free up before selling
+        const coin = pos.symbol.replace("USDT", "");
+        const held = await getSpotBalance(coin);
+        const expectedQty = pos.size / pos.entry;
+        if (held === null) {
+          console.log(`  ⚠️  Could not read ${coin} balance — keeping position OPEN, will retry exit next run`);
+          continue;
+        }
+        if (held < expectedQty * 0.02) {
+          // Tokens essentially gone — a server-side SL/TP already fired. Mark closed.
+          console.log(`  ⚠️  ${coin} balance ~0 (${held.toFixed(4)}) — already exited server-side, marking closed`);
+          sellConfirmed = true;
+        } else {
+          try {
+            // Sell the ACTUAL held quantity (not size/price) — no oversell at a loss, no dust at a gain.
+            await sellSpotHolding(pos.symbol, held);
+            console.log(`  ✅ VWAP SELL placed — sold ${held.toFixed(4)} ${coin} (held balance)`);
+            sellConfirmed = true;
+          } catch (e) {
+            console.log(`  ❌ VWAP sell FAILED (${e.message.slice(0,55)}) — ${coin} balance ${held.toFixed(4)} still held. Keeping position OPEN to retry (no orphan).`);
+            sellConfirmed = false;
+          }
         }
       }
-      const pnlUSD = (price - pos.entry) / pos.entry * pos.size;
+      if (!sellConfirmed) continue;  // do NOT mark closed — retry the exit on the next run
+      const FEE_RATE = 0.001; // 0.1% per side (Bybit spot taker fee)
+      const feesUSD  = pos.size * FEE_RATE * 2; // round-trip: entry + exit
+      const pnlUSD   = ((price - pos.entry) / pos.entry * pos.size) - feesUSD;
+      console.log(`  💸 Fees deducted: -$${feesUSD.toFixed(2)} | Net P&L: $${pnlUSD.toFixed(2)}`);
       writeTradeCsv({
         symbol: pos.symbol, strategy: "vwap_rsi3_ema8",
         side: "sell", price, tradeSize: pos.size,
@@ -782,6 +1603,400 @@ async function checkVwapPositions(log) {
   savePositions(positions);
 }
 
+// ─── Strategy C: Dip-Buyer entry + exit manager ──────────────────────────────
+
+// Record a PENDING limit order — status "pending_limit" until Bybit confirms fill.
+// The actual "open" record (with SL) is created in checkDipBuyerPendingOrders when filled.
+function recordDipBuyerPendingLimit(symbol, signalPrice, limitPrice, tradeSize, limitOrderId, dipStop, mode = "spot", leverage = 1, side = "long", dipTp = null) {
+  const positions = loadPositions();
+  // Remove any stale pending for this symbol (same side only — can have both long+short pending if different symbols)
+  const filtered = positions.filter((p) => !(p.symbol === symbol && p.status === "pending_limit" && p.side === side));
+  filtered.push({
+    symbol,
+    side,           // "long" or "short"
+    strategy: "dip_buyer",
+    status:         "pending_limit",
+    signalPrice:    +signalPrice.toFixed(6),
+    limitPrice:     +limitPrice.toFixed(6),
+    size:           tradeSize,
+    limitOrderId:   limitOrderId,
+    dipStop:        +dipStop.toFixed(6),
+    dipTp:          dipTp ? +dipTp.toFixed(6) : null,   // V2: exchange-native TP
+    mode,           // "spot" or "linear"
+    leverage,       // 1 (spot) or 2 (futures)
+    openTime:       new Date().toISOString(),
+  });
+  savePositions(filtered);
+  const modeTag  = mode === "linear" ? ` [linear ${leverage}×]` : "";
+  const sideTag  = side === "short" ? "SELL SHORT" : "BUY";
+  console.log(`  ⏳ Pending limit order recorded: ${sideTag} ${symbol} @ $${limitPrice.toFixed(4)}${modeTag} (${DIP_LIMIT_TIMEOUT}h timeout)`);
+}
+
+function openDipBuyerPosition(symbol, entry, tradeSize, orderId, stopPrice, slOrderId, mode = "spot", leverage = 1, side = "long", dipTp = null) {
+  const positions = loadPositions();
+  // Allow one long AND one short open simultaneously (different sides)
+  const filtered  = positions.filter((p) => !(p.symbol === symbol && p.status === "open" && p.side === side && p.strategy === "dip_buyer"));
+  filtered.push({
+    symbol, side,            // "long" or "short"
+    strategy: "dip_buyer", entry,
+    tp1: null, tp2: null, sl: null, slBE: null,   // null sl/tp1 → skipped by Hermes manager
+    dipStop:   +stopPrice.toFixed(6),             // catastrophic stop (below entry for long, above for short)
+    dipTp:     dipTp ? +dipTp.toFixed(6) : null, // V2: exchange-native 3:1 TP target
+    exitSma:   5, maxHoldHrs: 24,
+    slOrderId: slOrderId || null, tpOrderId: null,
+    mode,           // "spot" or "linear"
+    leverage,       // 1x (spot) or 2x (futures)
+    size: tradeSize, tp1Hit: false, status: "open",
+    openTime: new Date().toISOString(), orderId: orderId || null,
+  });
+  savePositions(filtered);
+  const modeTag  = mode === "linear" ? ` [${leverage}× linear]` : "";
+  const dir      = side === "short" ? "SHORT" : "BUY";
+  const exitNote = side === "short" ? "close<SMA5" : "close>SMA5";
+  console.log(`  📌 Dip-Buyer position: ${dir} ${symbol}${modeTag} @ $${entry} | stop $${stopPrice.toFixed(4)} | exit: ${exitNote} or 24h`);
+}
+
+// Checks all pending dip-buyer limit orders each run.
+//   Filled  → upgrade to "open", place server-side SL, send Telegram
+//   Timeout → cancel the order, clear pending record
+//   Already cancelled (Bybit) → just clear the pending record
+async function checkDipBuyerPendingOrders(log) {
+  const positions = loadPositions();
+  const pending = positions.filter((p) => p.status === "pending_limit" && p.strategy === "dip_buyer");
+  if (!pending.length) return;
+
+  console.log(`\n─── Dip-Buyer Pending Limit Orders (${pending.length}) ──────────`);
+  for (const pos of pending) {
+    const ageHrs = (Date.now() - new Date(pos.openTime).getTime()) / 3600000;
+    console.log(`  ${pos.symbol}: limit @ $${pos.limitPrice} | age ${ageHrs.toFixed(1)}h | orderId ${pos.limitOrderId}`);
+
+    const cat    = pos.mode === "linear" ? "linear" : "spot";
+    const lev    = pos.leverage || 1;
+    const status = await queryOrderStatus(pos.symbol, pos.limitOrderId, cat);
+    if (!status) {
+      console.log(`  ⚠️  Could not query order status — will retry next run`);
+      continue;
+    }
+
+    console.log(`  Bybit status: ${status.orderStatus} | avgFill=$${status.avgPrice} qty=${status.cumExecQty} [${cat}]`);
+
+    if (status.orderStatus === "Filled" || (status.cumExecQty > 0 && status.orderStatus === "PartiallyFilledCanceled")) {
+      // ── ORDER FILLED — upgrade to open position ──────────────────────────
+      const fillPrice = status.avgPrice > 0 ? status.avgPrice : pos.limitPrice;
+      const fillQty   = status.cumExecQty;
+      // For spot: filledUSD = notional. For futures: size = margin (notional / leverage).
+      const filledNotional = status.cumExecValue > 0 ? status.cumExecValue : fillQty * fillPrice;
+      const filledMargin   = cat === "linear" ? filledNotional / lev : filledNotional;
+      const feeLabel = cat === "linear" ? "0.02% futures maker" : "0.02% spot maker";
+      const modeLabel = cat === "linear" ? `futures ${lev}× (notional $${filledNotional.toFixed(2)})` : `spot`;
+      console.log(`  ✅ FILLED @ $${fillPrice.toFixed(4)} | qty ${fillQty} | margin $${filledMargin.toFixed(2)} | ${modeLabel} | fee ~${feeLabel}`);
+
+      // Spot: place separate server-side stop-loss now that we know the qty.
+      // Linear: SL was attached to the limit order at placement time — no extra step needed.
+      let slOrderId = null;
+      if (cat === "spot" && !CONFIG.paperTrading) {
+        try {
+          slOrderId = await placeSpotStopLoss(pos.symbol, fillQty, pos.dipStop);
+          console.log(`  🛡️ Spot stop-loss placed @ $${pos.dipStop.toFixed(4)} (id ${slOrderId})`);
+        } catch (e) {
+          console.log(`  ⚠️  Spot SL not placed (${e.message.slice(0,60)}) — exit manager protects`);
+        }
+      } else if (cat === "linear") {
+        console.log(`  🛡️ Native SL already attached to the order @ $${pos.dipStop.toFixed(4)}`);
+      }
+
+      // Upgrade record from pending → open
+      const posSide  = pos.side || "long";   // "long" or "short"
+      pos.status    = "open";
+      pos.entry     = fillPrice;
+      pos.size      = filledMargin;           // always margin (USD at risk)
+      pos.orderId   = pos.limitOrderId;
+      pos.slOrderId = slOrderId;
+      delete pos.limitOrderId;
+      delete pos.signalPrice;
+      delete pos.limitPrice;
+      pos.exitSma    = 5;
+      pos.maxHoldHrs = 24;
+      pos.tp1Hit     = false;
+      pos.tpOrderId  = null;
+      // dipTp already stored in pos from recordDipBuyerPendingLimit (V2)
+      // side, leverage, mode already stored in pos
+
+      const dirLabel = posSide === "short" ? "SHORT" : "LONG";
+      const exitNote = posSide === "short" ? "close &lt; SMA5 (recovery down)" : "close &gt; SMA5 (recovery up)";
+      const csvMode  = CONFIG.paperTrading ? "PAPER" : (cat === "linear" ? `LIVE-LINEAR-LIMIT-${lev}X` : "LIVE-SPOT-LIMIT");
+      writeTradeCsv({
+        symbol: pos.symbol, strategy: "dip_buyer", side: posSide === "short" ? "sell" : "buy",
+        price: fillPrice, tradeSize: filledMargin,
+        mode: csvMode,
+        signal: `DIP-${dirLabel} limit filled @ $${fillPrice.toFixed(4)} (maker ~0.02%)`,
+      });
+      log.trades.push({ timestamp: new Date().toISOString(), symbol: pos.symbol, side: posSide === "short" ? "sell" : "buy", price: fillPrice, orderPlaced: true, strategy: "dip_buyer", limitFill: true, mode: cat, direction: posSide });
+
+      const dirEmoji = posSide === "short" ? "🔴" : "✅";
+      await tg(
+`${dirEmoji} <b>Dip-Buyer ${dirLabel} LIMIT FILLED — ${pos.symbol}</b>
+📍 Fill: <b>$${fillPrice.toFixed(4)}</b>
+📊 Mode: ${cat === "linear" ? `Futures ${lev}× | Notional $${filledNotional.toFixed(2)} | Margin $${filledMargin.toFixed(2)}` : `Spot | $${filledMargin.toFixed(2)}`}
+💸 Fee: ~0.02% (maker)
+🛑 Stop: $${pos.dipStop.toFixed(4)}
+🎯 Exit: ${exitNote} | max 24h
+🕐 ${uaeTime()}`
+      );
+
+    } else if (status.orderStatus === "Cancelled" || status.orderStatus === "Rejected") {
+      console.log(`  🚫 Order ${status.orderStatus} on exchange — clearing pending record`);
+      pos.status = "cancelled_limit";
+
+    } else if (ageHrs >= DIP_LIMIT_TIMEOUT) {
+      // ── TIMEOUT — cancel the unfilled limit ─────────────────────────────
+      console.log(`  ⏱️  Timeout (${ageHrs.toFixed(1)}h ≥ ${DIP_LIMIT_TIMEOUT}h) — cancelling unfilled limit`);
+      if (!CONFIG.paperTrading) {
+        const cancelled = await cancelSpotOrder(pos.symbol, pos.limitOrderId, cat);
+        console.log(`  🧹 Cancel ${cancelled ? "✅ done" : "⚠️ failed (may already be gone)"}`);
+      }
+      pos.status = "cancelled_limit";
+      await tg(`⏱️ <b>Dip-Buyer limit expired — ${pos.symbol}</b>\nLimit @ $${pos.limitPrice.toFixed(4)} not filled after ${DIP_LIMIT_TIMEOUT}h — cancelled.\nWaiting for next signal. 🔄`);
+
+    } else {
+      const remaining = DIP_LIMIT_TIMEOUT - ageHrs;
+      console.log(`  ⏳ Still pending — ${remaining.toFixed(1)}h remaining before timeout`);
+    }
+  }
+  savePositions(positions);
+}
+
+async function processDipBuyer(asset, log) {
+  console.log(`\n─── ${asset.symbol} [dip_buyer] ─────────────────────`);
+  const candles = await fetchCandles(asset.okx, "1H", 250);   // need 200+ bars for SMA200
+  const price   = candles[candles.length - 1].close;
+  const result  = checkStratDipBuyer(candles);
+  const ind     = result.indicators || {};
+  if (ind.rsi2 !== undefined)
+    console.log(`  Price: $${price.toFixed(4)} [1H] | SMA200=$${ind.sma200?.toFixed(2)} SMA50=$${ind.sma50?.toFixed(2)} RSI2=${ind.rsi2?.toFixed(1)}`);
+
+  if (!result.signal) { console.log(`  ⏸  No signal — ${result.reason}`); return false; }
+
+  // signal = "buy" (long dip) or "sell" (short spike)
+  const isShort   = result.side === "short";
+  const dirLabel  = isShort ? "SHORT" : "BUY";
+  const dirEmoji  = isShort ? "🔴" : "🟢";
+  console.log(`  🎯 SIGNAL: ${dirLabel} — ${result.reason}`);
+
+  // Block if same-side position/pending already open (allow long+short simultaneously)
+  const allPos = loadPositions();
+  const sameOpenPos = allPos.some(
+    (p) => p.symbol === asset.symbol && p.status === "open" && (p.side || "long") === result.side && p.strategy === "dip_buyer"
+  );
+  const samePending = allPos.some(
+    (p) => p.symbol === asset.symbol && p.status === "pending_limit" && (p.side || "long") === result.side
+  );
+  if (sameOpenPos) {
+    console.log(`  🔒 BLOCKED — ${asset.symbol} already has an open ${dirLabel} position.`);
+    return false;
+  }
+  if (samePending) {
+    console.log(`  ⏳ BLOCKED — already have a pending ${dirLabel} limit order for ${asset.symbol}. Waiting for fill.`);
+    return false;
+  }
+
+  // ── V2: Max concurrent positions cap ────────────────────────────────────
+  const totalOpen = allPos.filter((p) => (p.status === "open" || p.status === "pending_limit") && p.strategy === "dip_buyer").length;
+  if (DIP_V2_ENABLED && totalOpen >= DIP_V2_MAX_CONCURRENT) {
+    console.log(`  🚦 BLOCKED — ${totalOpen}/${DIP_V2_MAX_CONCURRENT} concurrent positions open. Waiting for exit.`);
+    return false;
+  }
+
+  const tradeSize = getTradeSize();
+  const stopPrice = result.stopPrice;
+  const tpPrice   = result.tpPrice || null;
+  const dp  = PRICE_DECIMALS[asset.symbol] ?? 2;
+  const lev = DIP_BUYER_LEVERAGE;
+  const isFutures = DIP_BUYER_MODE === "linear";
+  const notional  = tradeSize * lev;
+
+  // ── V2: Entry at candle LOW (long) or HIGH (short) — exact structure level
+  // ── V1: Entry offset 0.15% from close
+  const limitPrice = result.limitPrice !== null && result.limitPrice !== undefined
+    ? result.limitPrice                              // V2: candle low/high
+    : isShort
+      ? price * (1 + DIP_LIMIT_OFFSET / 100)        // V1 short: above close
+      : price * (1 - DIP_LIMIT_OFFSET / 100);       // V1 long: below close
+  const risk      = Math.abs(limitPrice - stopPrice);
+  const modeTag   = isFutures ? ` [${lev}× futures, notional $${notional.toFixed(0)}]` : " [spot]";
+  const entryDesc = DIP_V2_ENABLED
+    ? (isShort ? `candle HIGH $${limitPrice.toFixed(dp)}` : `candle LOW $${limitPrice.toFixed(dp)}`)
+    : (isShort ? `close+${DIP_LIMIT_OFFSET}% $${limitPrice.toFixed(dp)}` : `close−${DIP_LIMIT_OFFSET}% $${limitPrice.toFixed(dp)}`);
+  console.log(`  📐 V2 Entry: ${entryDesc}${modeTag} | SL $${stopPrice.toFixed(dp)} | TP $${tpPrice?.toFixed(dp) ?? "n/a"} (3:1) | timeout ${DIP_LIMIT_TIMEOUT}h`);
+
+  if (CONFIG.paperTrading) {
+    const paperMode = isFutures ? `PAPER-LINEAR-${lev}X-${dirLabel}-V2` : "PAPER-LIMIT-V2";
+    console.log(`  📋 PAPER V2: ${dirLabel} ${asset.symbol} @ $${limitPrice.toFixed(dp)} | SL $${stopPrice.toFixed(dp)} | TP $${tpPrice?.toFixed(dp) ?? "n/a"} | risk $${risk.toFixed(dp)}`);
+    writeTradeCsv({ symbol: asset.symbol, strategy: "dip_buyer_v2", side: isShort ? "sell" : "buy", price: limitPrice, tradeSize, mode: paperMode, signal: result.reason });
+    log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: isShort ? "sell" : "buy", price: limitPrice, orderPlaced: true, paper: true, strategy: "dip_buyer_v2", direction: result.side });
+    openDipBuyerPosition(asset.symbol, limitPrice, tradeSize, null, stopPrice, null, DIP_BUYER_MODE, lev, result.side, tpPrice);
+    const riskUsd = (risk / limitPrice) * notional;
+    await tg(
+`📋 ${dirEmoji} <b>Dip-Buyer V2 ${dirLabel} [PAPER] — ${asset.symbol}</b>
+📍 Entry: <b>$${limitPrice.toFixed(dp)}</b> (candle ${isShort ? "HIGH" : "LOW"})
+🛑 Stop:  $${stopPrice.toFixed(dp)} (${(DIP_V2_STOP_BUFFER*100).toFixed(1)}% buffer)
+🎯 TP:    $${tpPrice?.toFixed(dp) ?? "n/a"} (3:1 RR)
+💰 Risk:  $${riskUsd.toFixed(2)} | Margin $${tradeSize} | ${lev}× leverage
+🕐 ${uaeTime()}`
+    );
+    return true;
+  }
+
+  try {
+    let order;
+    if (isFutures) {
+      await setBybitLeverage(asset.symbol, lev);
+      console.log(`  ⚙️  Leverage set to ${lev}×`);
+      if (isShort) {
+        order = await placeLimitSellLinear(asset.symbol, tradeSize, lev, limitPrice, stopPrice, tpPrice);
+        console.log(`  ⏳ FUTURES SHORT V2 LIMIT: ${asset.symbol} @ $${limitPrice.toFixed(dp)} | SL $${stopPrice.toFixed(dp)} | TP $${tpPrice?.toFixed(dp)} | ID: ${order.orderId}`);
+      } else {
+        order = await placeLimitBuyLinear(asset.symbol, tradeSize, lev, limitPrice, stopPrice, tpPrice);
+        console.log(`  ⏳ FUTURES LONG V2 LIMIT: ${asset.symbol} @ $${limitPrice.toFixed(dp)} | SL $${stopPrice.toFixed(dp)} | TP $${tpPrice?.toFixed(dp)} | ID: ${order.orderId}`);
+      }
+    } else {
+      order = await placeLimitBuySpot(asset.symbol, tradeSize, limitPrice);
+      console.log(`  ⏳ SPOT LONG LIMIT: BUY ${asset.symbol} @ $${limitPrice.toFixed(dp)} | ID: ${order.orderId}`);
+    }
+
+    const csvMode = isFutures ? `LIVE-LINEAR-LIMIT-${lev}X-${dirLabel}-V2-PENDING` : "LIVE-SPOT-LIMIT-V2-PENDING";
+    writeTradeCsv({ symbol: asset.symbol, strategy: "dip_buyer_v2", side: isShort ? "sell" : "buy", price: limitPrice, tradeSize, orderId: order.orderId, mode: csvMode, signal: `${result.reason} | SL=${stopPrice.toFixed(dp)} TP=${tpPrice?.toFixed(dp)}` });
+    log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: isShort ? "sell" : "buy", price: limitPrice, orderPlaced: true, orderId: order.orderId, strategy: "dip_buyer_v2", pending: true, mode: DIP_BUYER_MODE, direction: result.side });
+    recordDipBuyerPendingLimit(asset.symbol, price, limitPrice, tradeSize, order.orderId, stopPrice, DIP_BUYER_MODE, lev, result.side, tpPrice);
+
+    const riskUsd = (risk / limitPrice) * notional;
+    await tg(
+`⏳ ${dirEmoji} <b>Dip-Buyer V2 ${dirLabel} PLACED — ${asset.symbol}</b>
+📍 Entry: <b>$${limitPrice.toFixed(dp)}</b> (candle ${isShort ? "HIGH" : "LOW"})
+🛑 Stop:  $${stopPrice.toFixed(dp)} (0.3% buffer) ← exchange-native
+🎯 TP:    $${tpPrice?.toFixed(dp) ?? "n/a"} (3:1 RR) ← exchange-native
+💰 Risk:  $${riskUsd.toFixed(2)} | Margin $${tradeSize} | Notional $${notional.toFixed(0)}
+⚡ Both SL+TP on exchange — protected even if bot offline
+🕐 ${uaeTime()}`
+    );
+    return true;
+  } catch (err) {
+    console.log(`  ❌ V2 ${dirLabel} order failed: ${err.message}`);
+    return false;
+  }
+}
+
+async function checkDipBuyerPositions(log) {
+  const positions = loadPositions();
+  const open = positions.filter((p) => p.status === "open" && p.strategy === "dip_buyer");
+  if (!open.length) return;
+
+  console.log(`\n─── Dip-Buyer Exit Manager (${open.length} open) ─────────────`);
+  for (const pos of open) {
+    const okxSymbol = pos.symbol.replace("USDT", "-USDT");
+    let candles;
+    try { candles = await fetchCandles(okxSymbol, "1H", 30); }
+    catch (e) { console.log(`  ⚠️  ${pos.symbol} fetch failed: ${e.message}`); continue; }
+
+    const closes = candles.map((c) => c.close);
+    const price  = closes[closes.length - 1];
+    const sma5   = calcSMA(closes, 5);
+    const ageHrs = (Date.now() - new Date(pos.openTime).getTime()) / 3600000;
+    const stop   = pos.dipStop;
+
+    const posSide  = pos.side || "long";    // "long" or "short" (default long for legacy positions)
+    const posMode  = pos.mode || "spot";    // "spot" or "linear"
+    const posLev   = pos.leverage || 1;
+    const notional = pos.size * posLev;    // actual $ exposure
+    const pct = ((price - pos.entry) / pos.entry) * 100;
+    const dipTp = pos.dipTp || null;   // V2: exchange-native TP level (null for V1 positions)
+    let exitReason = null;
+    if (posSide === "long") {
+      // LONG exits (priority order):
+      if (stop != null && price <= stop)            exitReason = "stop_loss";
+      else if (dipTp != null && price >= dipTp)     exitReason = "tp3x";           // V2: 3:1 TP hit
+      else if (sma5 != null && price > sma5)        exitReason = "recovery_sma5";  // V1 fallback
+      else if (ageHrs >= (pos.maxHoldHrs || 24))    exitReason = "max_hold";
+    } else {
+      // SHORT exits (priority order):
+      if (stop != null && price >= stop)            exitReason = "stop_loss";
+      else if (dipTp != null && price <= dipTp)     exitReason = "tp3x";           // V2: 3:1 TP hit
+      else if (sma5 != null && price < sma5)        exitReason = "recovery_sma5";  // V1 fallback
+      else if (ageHrs >= (pos.maxHoldHrs || 24))    exitReason = "max_hold";
+    }
+    const tpLabel = dipTp ? ` TP=$${dipTp.toFixed(4)}` : "";
+    console.log(`  ${pos.symbol} [${posSide}]: entry=$${pos.entry} now=$${price.toFixed(4)} P&L=${pct.toFixed(2)}% | SMA5=$${sma5?.toFixed(4)} stop=$${stop?.toFixed(4)}${tpLabel} age=${ageHrs.toFixed(1)}h${exitReason ? ` → ${exitReason}` : ""}`);
+    if (!exitReason) continue;
+
+    let closeConfirmed = CONFIG.paperTrading;
+
+    if (!CONFIG.paperTrading) {
+      if (posMode === "linear") {
+        // ── Futures exit: reduceOnly market order (opposite side) ───────────
+        const closeSide = posSide === "short" ? "buy" : "sell";  // buy to close short, sell to close long
+        try {
+          await placeBybitOrder(pos.symbol, closeSide, notional, price, "linear", null, true);
+          console.log(`  ✅ Dip-Buyer FUTURES ${closeSide.toUpperCase()} (close ${posSide}) — $${notional.toFixed(0)} notional of ${pos.symbol} (${exitReason})`);
+          closeConfirmed = true;
+        } catch (e) {
+          console.log(`  ❌ Futures close FAILED (${e.message.slice(0,60)}) — keeping OPEN to retry`);
+          closeConfirmed = false;
+        }
+      } else {
+        // ── Spot exit: only LONG is possible in spot ────────────────────────
+        if (pos.slOrderId) {
+          const c = await cancelSpotConditional(pos.symbol, pos.slOrderId);
+          console.log(`  🧹 Stop-loss order ${c ? "cancelled" : "already gone/triggered"}`);
+        }
+        await new Promise((r) => setTimeout(r, 500));
+        const coin = pos.symbol.replace("USDT", "");
+        const held = await getSpotBalance(coin);
+        const expectedQty = pos.size / pos.entry;
+        if (held === null) { console.log(`  ⚠️  Could not read ${coin} balance — keeping OPEN, retry next run`); continue; }
+        if (held < expectedQty * 0.02) {
+          console.log(`  ⚠️  ${coin} balance ~0 (${held.toFixed(4)}) — already exited server-side, marking closed`);
+          closeConfirmed = true;
+        } else {
+          try {
+            await sellSpotHolding(pos.symbol, held);
+            console.log(`  ✅ Dip-Buyer SPOT SELL — sold ${held.toFixed(4)} ${coin} (${exitReason})`);
+            closeConfirmed = true;
+          } catch (e) {
+            console.log(`  ❌ Sell FAILED (${e.message.slice(0,55)}) — ${coin} ${held.toFixed(4)} still held. Keeping OPEN to retry.`);
+            closeConfirmed = false;
+          }
+        }
+      }
+    }
+    if (!closeConfirmed) continue;
+
+    // Fee accounting: entry always limit (maker 0.02%), exit always market
+    const entryFeeRate = posMode === "linear" ? FEE_FUT_MAKER : FEE_SPOT_MAKER;
+    const exitFeeRate  = posMode === "linear" ? FEE_FUT_TAKER : FEE_SPOT_TAKER;
+    const feesUSD  = notional * (entryFeeRate + exitFeeRate);
+    // Gross P&L: long = (exit−entry)/entry × notional; short = (entry−exit)/entry × notional
+    const grossPnl = posSide === "short"
+      ? (pos.entry - price) / pos.entry * notional
+      : (price - pos.entry) / pos.entry * notional;
+    const pnlUSD   = grossPnl - feesUSD;
+    const feeDesc  = posMode === "linear"
+      ? `entry 0.02% + exit 0.055% on $${notional.toFixed(0)} notional`
+      : `entry 0.02% + exit 0.10% on $${pos.size.toFixed(0)}`;
+    console.log(`  💸 Fees -$${feesUSD.toFixed(2)} (${feeDesc}) | Gross $${grossPnl.toFixed(2)} | Net P&L $${pnlUSD.toFixed(2)} (${exitReason})`);
+
+    const closeCsvSide = posSide === "short" ? "buy" : "sell";   // buy to close short
+    const csvMode      = CONFIG.paperTrading ? "PAPER" : (posMode === "linear" ? `LIVE-LINEAR-${posLev}X` : "LIVE-SPOT");
+    writeTradeCsv({ symbol: pos.symbol, strategy: "dip_buyer", side: closeCsvSide, price, tradeSize: pos.size, mode: csvMode, signal: `EXIT_${posSide.toUpperCase()}_${exitReason} pnl=$${pnlUSD.toFixed(2)}` });
+    pos.status = "closed"; pos.closeReason = exitReason; pos.closePrice = price; pos.closeTime = new Date().toISOString(); pos.pnl = pnlUSD;
+    log.trades.push({ timestamp: new Date().toISOString(), symbol: pos.symbol, side: closeCsvSide, price, orderPlaced: true, reason: exitReason, direction: posSide });
+    const exitEmoji   = { stop_loss: "🛑", recovery_sma5: "✅", max_hold: "⏱️" };
+    const dirEmoji    = posSide === "short" ? "🔴" : "🟢";
+    const modeLine    = posMode === "linear" ? `\n📈 ${posLev}× Futures | Notional $${notional.toFixed(0)}` : "";
+    await tg(`${exitEmoji[exitReason]||"🔔"} <b>Dip-Buyer ${posSide.toUpperCase()} EXIT — ${pos.symbol}</b>\n${dirEmoji} Entry: $${pos.entry}\n📤 Exit:  $${price.toFixed(4)}${modeLine}\n💵 P&L:  ${pnlUSD>=0?"+":""}$${pnlUSD.toFixed(2)}\n📋 ${exitReason}\n🕐 ${uaeTime()}`);
+  }
+  savePositions(positions);
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function run() {
@@ -795,7 +2010,7 @@ async function run() {
 
   console.log("═══════════════════════════════════════════════════════════");
   console.log("  Claude Trading Bot — Multi-Asset");
-  console.log(`  ${new Date().toISOString()}`);
+  console.log(`  ${uaeTime()}`);
   console.log(`  Mode: ${CONFIG.paperTrading ? "📋 PAPER TRADING" : "🔴 LIVE TRADING"}`);
   const tradeSize = getTradeSize();
   const sizeLabel = CONFIG.tradeSizePct > 0
@@ -804,13 +2019,14 @@ async function run() {
   console.log(`  Timeframe: ${CONFIG.timeframe} | Trade size: ${sizeLabel}`);
   console.log("═══════════════════════════════════════════════════════════");
 
-  // Daily trade limit check
+  // Daily trade limit check (set MAX_TRADES_PER_DAY=0 in .env to disable)
   const log = loadLog();
   const todayCount = countTodaysTrades(log);
-  console.log(`\n  Trades today: ${todayCount}/${CONFIG.maxTradesPerDay}`);
-  if (todayCount >= CONFIG.maxTradesPerDay) {
-    console.log("  🚫 Daily limit reached — stopping.");
-    return;
+  const limitDisabled = CONFIG.maxTradesPerDay === 0;
+  console.log(`\n  Trades today: ${todayCount}${limitDisabled ? " (no limit)" : "/"+CONFIG.maxTradesPerDay}`);
+  const dailyLimitReached = !limitDisabled && todayCount >= CONFIG.maxTradesPerDay;
+  if (dailyLimitReached) {
+    console.log("  🚫 Daily limit reached — no new entries. Checking open positions...");
   }
 
   // ── #6 Max drawdown protection — percentage-based, scales with portfolio ────
@@ -877,10 +2093,19 @@ Bot resumes automatically tomorrow. 🔄`
   // ── Step 1b: Check open VWAP positions (spot RSI exit + SL + expiry) ─────
   await checkVwapPositions(log);
 
-  // ── Step 2: Scan each asset for new entries ───────────────────────────────
+  // ── Step 1c: Check pending dip-buyer limit orders (filled? timeout?) ──────
+  await checkDipBuyerPendingOrders(log);
+
+  // ── Step 1d: Check open Dip-Buyer positions (close>SMA5 / stop / 24h) ────
+  await checkDipBuyerPositions(log);
+
+  // ── Step 2: Scan each asset for new entries (skipped if daily limit hit) ────
+  if (dailyLimitReached) {
+    console.log("\n  ⏭️  Skipping new entry scan — daily limit reached.");
+  }
   let tradesThisRun = 0;
-  for (const asset of WATCHLIST) {
-    if (todayCount + tradesThisRun >= CONFIG.maxTradesPerDay) {
+  for (const asset of dailyLimitReached ? [] : WATCHLIST) {
+    if (!limitDisabled && todayCount + tradesThisRun >= CONFIG.maxTradesPerDay) {
       console.log("\n  Daily limit reached mid-scan — stopping.");
       break;
     }
@@ -895,6 +2120,8 @@ Bot resumes automatically tomorrow. 🔄`
     } catch (err) {
       console.log(`  ❌ ${asset.symbol} error: ${err.message}`);
     }
+    // Small inter-asset delay to avoid OKX rate limiting (prevents "insufficient data")
+    await new Promise(r => setTimeout(r, 300));
   }
 
   saveLog(log);
@@ -913,8 +2140,8 @@ Bot resumes automatically tomorrow. 🔄`
 // ─── #4 Daily P&L Summary ────────────────────────────────────────────────────
 async function sendDailySummaryIfDue(log) {
   const now   = new Date();
-  const hour  = now.getUTCHours();
-  if (hour < 9) return; // only after 09:00 UTC
+  const uaeHour = (now.getUTCHours() + 4) % 24; // UAE = UTC+4
+  if (uaeHour < 9) return; // only after 09:00 UAE
 
   const today = now.toISOString().slice(0, 10);
   const alreadySent = log.trades.some(t => t.dailySummarySent === today);
@@ -938,7 +2165,7 @@ async function sendDailySummaryIfDue(log) {
   const pnlEmoji = totalPnl >= 0 ? "💚" : "🔴";
 
   await tg(
-`📊 <b>Daily Summary — ${today}</b>
+`📊 <b>Daily Summary — ${uaeTime(now)}</b>
 ${pnlEmoji} P&L:         <b>${pnlStr}</b>
 🎯 Trades:      ${closedPositions.length} closed (${wins}W / ${losses}L)
 📈 Win rate:    ${wr}%
@@ -952,19 +2179,79 @@ ${pnlEmoji} P&L:         <b>${pnlStr}</b>
   saveLog(log);
 }
 
-// ─── #5 Heartbeat ────────────────────────────────────────────────────────────
+// ─── #5 Heartbeat + Gap Detector ─────────────────────────────────────────────
+// Two jobs:
+//   A) Gap alert  — if the bot restarts after a long silence, immediately alert.
+//      Catches crashes / deploy failures / Railway restarts that left a gap.
+//   B) Daily ping — once per day after 09:00 UAE, send "✅ bot alive" to Telegram.
+//      If the user doesn't receive this, the bot is down.
 async function sendHeartbeatIfDue(log) {
-  const now  = new Date();
-  const hour = now.getUTCHours();
-  if (hour < 9) return;
+  const now   = new Date();
+  const today = now.toISOString().slice(0, 10);   // UTC date key for dedup logic
+  // UAE-formatted date for display (e.g. "13 Jun 2026")
+  const uaeDate = now.toLocaleDateString("en-GB", {
+    timeZone: "Asia/Dubai", day: "2-digit", month: "short", year: "numeric"
+  });
 
-  const today = now.toISOString().slice(0, 10);
+  // ── A) Gap detection — fire whenever we restart after >2h of silence ────────
+  const GAP_ALERT_HRS = 2;
+  const lastRunEntry  = [...log.trades].reverse().find(t => t.botRun);
+  const lastRunTime   = lastRunEntry ? new Date(lastRunEntry.timestamp) : null;
+  const gapHrs        = lastRunTime ? (now - lastRunTime) / 3600000 : 0;
+
+  if (lastRunTime && gapHrs >= GAP_ALERT_HRS) {
+    const gapStr = gapHrs < 24
+      ? `${gapHrs.toFixed(1)} hours`
+      : `${(gapHrs / 24).toFixed(1)} days`;
+    console.log(`  ⚠️  Bot was offline for ${gapStr} (last run: ${uaeTime(lastRunTime)})`);
+    await tg(
+`⚠️ <b>Bot gap detected — ${gapStr} offline</b>
+Last run: ${uaeTime(lastRunTime)}
+Now: ${uaeTime()}
+Bot is back online and scanning. ✅
+If this gap was unintentional, check Railway logs.`
+    );
+  }
+
+  // Record this run so next invocation can measure the gap
+  log.trades.push({ timestamp: now.toISOString(), botRun: true, orderPlaced: false });
+  saveLog(log);   // ← persist heartbeat on EVERY scan so gap detector always has fresh data
+
+  // ── B) Daily "alive" ping — once per day after 09:00 UAE ────────────────────
+  const uaeHour    = (now.getUTCHours() + 4) % 24;
+  if (uaeHour < 9) return;                                      // too early
   const alreadySent = log.trades.some(t => t.heartbeatSent === today);
-  if (alreadySent) return;
+  if (alreadySent) return;                                       // already sent today
 
-  // heartbeat is folded into daily summary — mark it sent here
+  // Gather open position summary for the ping
+  const openPos = loadPositions().filter(p => p.status === "open" || p.status === "pending_limit");
+  const posLines = openPos.length
+    ? openPos.map(p => {
+        if (p.status === "pending_limit") return `  ⏳ ${p.symbol} limit @ $${p.limitPrice?.toFixed(4)} (pending)`;
+        const pct = p.entry ? ((0) / p.entry * 100).toFixed(2) : "?";  // price not fetched here
+        return `  📌 ${p.symbol} @ $${p.entry} [${p.strategy}]`;
+      }).join("\n")
+    : "  None";
+
+  const todayTrades = log.trades.filter(t => t.timestamp?.startsWith(today) && t.orderPlaced);
+  const closedToday = loadPositions().filter(p => p.status === "closed" && p.closeTime?.startsWith(today));
+  const dailyPnl    = closedToday.reduce((s, p) => s + (p.pnl ?? 0), 0);
+
+  await tg(
+`✅ <b>Bot Heartbeat — ${uaeDate}</b>
+🕐 ${uaeTime()}
+📊 Mode: LIVE | $${CONFIG.portfolioUSD.toLocaleString()} account
+💰 Today's P&L: ${dailyPnl >= 0 ? "+" : ""}$${dailyPnl.toFixed(2)}
+📈 Trades today: ${todayTrades.length}
+🔍 Watching: ${WATCHLIST.map(w => w.symbol.replace("USDT","")).join(" · ")}
+📌 Open positions:
+${posLines}
+🤖 Scanning every hour. Next ping ~09:00 UAE tomorrow.`
+  );
+
   log.trades.push({ timestamp: now.toISOString(), heartbeatSent: today, orderPlaced: false });
   saveLog(log);
+  console.log(`  💓 Daily heartbeat sent to Telegram`);
 }
 
 // Handle --tax-summary flag
