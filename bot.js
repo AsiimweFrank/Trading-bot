@@ -41,7 +41,7 @@ const CONFIG = {
   tradeSizePct:     parseFloat(process.env.TRADE_SIZE_PCT     || "0"),    // e.g. 10 = 10% of portfolio
   portfolioUSD:     parseFloat(process.env.PORTFOLIO_VALUE_USD || "500"), // current account size
   maxTradeSizeUSD:  parseFloat(process.env.MAX_TRADE_SIZE_USD  || "50"),  // fallback fixed size
-  maxTradesPerDay:  parseInt(process.env.MAX_TRADES_PER_DAY    || "5"),
+  maxTradesPerDay:  parseInt(process.env.MAX_TRADES_PER_DAY    || "10"),  // entries only (exits no longer counted)
   paperTrading:     process.env.PAPER_TRADING    !== "false",
   tradeMode:        process.env.TRADE_MODE       || "spot",
   bybit: {
@@ -186,7 +186,11 @@ function saveLog(log) {
 
 function countTodaysTrades(log) {
   const today = new Date().toISOString().slice(0, 10);
-  return log.trades.filter((t) => t.timestamp.startsWith(today) && t.orderPlaced).length;
+  // BUG FIX: only count NEW ENTRIES (not exits) against the daily limit.
+  // Previously, exit orders were also logged with orderPlaced:true, consuming the
+  // daily limit after just 3 entries + 3 exits (3+3=6 > limit of 5). Now we only
+  // count rows that represent a new position opening (entry:true flag).
+  return log.trades.filter((t) => t.timestamp.startsWith(today) && t.entry === true).length;
 }
 
 // ─── Market Data (OKX public API) ────────────────────────────────────────────
@@ -370,7 +374,7 @@ const DIP_LIMIT_TIMEOUT  = parseFloat(process.env.DIP_LIMIT_TIMEOUT  || "2");   
 const DIP_V2_ENABLED     = process.env.DIP_STRATEGY_V2 !== "false";  // default ON
 const DIP_V2_STOP_BUFFER = parseFloat(process.env.DIP_V2_STOP_BUFFER || "0.003"); // 0.3% candle buffer
 const DIP_V2_RR          = parseFloat(process.env.DIP_V2_RR          || "3");     // 3:1 risk:reward
-const DIP_V2_MAX_CONCURRENT = parseInt(process.env.DIP_V2_MAX_CONCURRENT || "2"); // max 2 open at once
+const DIP_V2_MAX_CONCURRENT = parseInt(process.env.DIP_V2_MAX_CONCURRENT || "4"); // max 4 open at once (was 2 — too restrictive for 8 coins)
 // Futures mode: "spot" (default) or "linear" (perpetual futures with leverage)
 // V2 requires "linear" (futures) to enable shorts — default to linear now
 const DIP_BUYER_MODE     = process.env.DIP_BUYER_MODE     || "linear";
@@ -1342,7 +1346,7 @@ async function processAsset(asset, log) {
   if (CONFIG.paperTrading) {
     console.log(`  📋 PAPER: Would ${result.side.toUpperCase()} $${tradeSize} of ${asset.symbol} @ $${price.toFixed(4)}`);
     writeTradeCsv({ symbol: asset.symbol, strategy: asset.strategy, side: result.side, price, tradeSize, mode: "PAPER", signal: result.reason });
-    log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: result.side, price, orderPlaced: true, paper: true });
+    log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: result.side, price, orderPlaced: true, paper: true, entry: true });
     openPositionRecord(asset.symbol, result.side, price, tradeSize, asset.strategy, null, asset.vwapSlPct);
     if (isHermes) {
       const tp1 = (price * 0.985).toFixed(4), tp2 = (price * 0.970).toFixed(4), sl = (price * 1.015).toFixed(4);
@@ -1393,7 +1397,7 @@ async function processAsset(asset, log) {
     }
     console.log(`  ✅ ORDER PLACED: ${result.side.toUpperCase()} ${asset.symbol} [${execMode}] | ID: ${order.orderId}${isHermes ? ` | 🛡️ SL @ $${slPrice.toFixed(dp)} 🎯 TP2 @ $${tp2Price.toFixed(dp)}` : ""}`);
     writeTradeCsv({ symbol: asset.symbol, strategy: "hermes_v06", side: result.side, price, tradeSize, orderId: order.orderId, mode: `LIVE-${execMode.toUpperCase()}`, signal: result.reason });
-    log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: result.side, price, orderPlaced: true, orderId: order.orderId, execMode });
+    log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: result.side, price, orderPlaced: true, orderId: order.orderId, execMode, entry: true });
     openPositionRecord(asset.symbol, result.side, price, tradeSize, "hermes_v06", order.orderId, asset.vwapSlPct, slOrderId, tpOrderId);
     if (isHermes) {
       // Write journal entry with full indicators
@@ -1438,7 +1442,7 @@ async function processHermesDualScan(asset, log) {
   const tp1str = (price * 0.985).toFixed(4), tp2str = (price * 0.970).toFixed(4), slStr = (price * 1.015).toFixed(4);
   if (CONFIG.paperTrading) {
     writeTradeCsv({ symbol: asset.symbol, strategy: "hermes_v04", side: result.side, price, tradeSize, mode: "PAPER", signal: result.reason });
-    log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: result.side, price, orderPlaced: true, paper: true });
+    log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: result.side, price, orderPlaced: true, paper: true, entry: true });
     openHermesPosition(asset.symbol, price, tradeSize, null);
     await tgEntry(asset.symbol, result.side, price.toFixed(4), tradeSize, tp1str, tp2str, slStr, "Hermes v05 [PAPER]");
     return true;
@@ -1450,7 +1454,7 @@ async function processHermesDualScan(asset, log) {
     const order = await placeBybitOrder(asset.symbol, result.side, tradeSize, price, "linear", slPrice, false, tpPrice);
     console.log(`  🛡️ native SL @ $${slPrice.toFixed(dp)} 🎯 TP @ $${tpPrice.toFixed(dp)}`);
     writeTradeCsv({ symbol: asset.symbol, strategy: "hermes_v05", side: result.side, price, tradeSize, orderId: order.orderId, mode: "LIVE-LINEAR", signal: result.reason });
-    log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: result.side, price, orderPlaced: true, orderId: order.orderId, execMode: "linear" });
+    log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: result.side, price, orderPlaced: true, orderId: order.orderId, execMode: "linear", entry: true });
     openHermesPosition(asset.symbol, price, tradeSize, order.orderId);
     await tgEntry(asset.symbol, result.side, price.toFixed(4), tradeSize, tp1str, tp2str, slStr, "Hermes v05 [LIVE]");
     return true;
@@ -1731,7 +1735,7 @@ async function checkDipBuyerPendingOrders(log) {
         mode: csvMode,
         signal: `DIP-${dirLabel} limit filled @ $${fillPrice.toFixed(4)} (maker ~0.02%)`,
       });
-      log.trades.push({ timestamp: new Date().toISOString(), symbol: pos.symbol, side: posSide === "short" ? "sell" : "buy", price: fillPrice, orderPlaced: true, strategy: "dip_buyer", limitFill: true, mode: cat, direction: posSide });
+      log.trades.push({ timestamp: new Date().toISOString(), symbol: pos.symbol, side: posSide === "short" ? "sell" : "buy", price: fillPrice, orderPlaced: true, strategy: "dip_buyer", limitFill: true, mode: cat, direction: posSide, entry: true });
 
       const dirEmoji = posSide === "short" ? "🔴" : "✅";
       await tg(
@@ -1833,7 +1837,7 @@ async function processDipBuyer(asset, log) {
     const paperMode = isFutures ? `PAPER-LINEAR-${lev}X-${dirLabel}-V2` : "PAPER-LIMIT-V2";
     console.log(`  📋 PAPER V2: ${dirLabel} ${asset.symbol} @ $${limitPrice.toFixed(dp)} | SL $${stopPrice.toFixed(dp)} | TP $${tpPrice?.toFixed(dp) ?? "n/a"} | risk $${risk.toFixed(dp)}`);
     writeTradeCsv({ symbol: asset.symbol, strategy: "dip_buyer_v2", side: isShort ? "sell" : "buy", price: limitPrice, tradeSize, mode: paperMode, signal: result.reason });
-    log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: isShort ? "sell" : "buy", price: limitPrice, orderPlaced: true, paper: true, strategy: "dip_buyer_v2", direction: result.side });
+    log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: isShort ? "sell" : "buy", price: limitPrice, orderPlaced: true, paper: true, strategy: "dip_buyer_v2", direction: result.side, entry: true });
     openDipBuyerPosition(asset.symbol, limitPrice, tradeSize, null, stopPrice, null, DIP_BUYER_MODE, lev, result.side, tpPrice);
     const riskUsd = (risk / limitPrice) * notional;
     await tg(
@@ -1866,7 +1870,7 @@ async function processDipBuyer(asset, log) {
 
     const csvMode = isFutures ? `LIVE-LINEAR-LIMIT-${lev}X-${dirLabel}-V2-PENDING` : "LIVE-SPOT-LIMIT-V2-PENDING";
     writeTradeCsv({ symbol: asset.symbol, strategy: "dip_buyer_v2", side: isShort ? "sell" : "buy", price: limitPrice, tradeSize, orderId: order.orderId, mode: csvMode, signal: `${result.reason} | SL=${stopPrice.toFixed(dp)} TP=${tpPrice?.toFixed(dp)}` });
-    log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: isShort ? "sell" : "buy", price: limitPrice, orderPlaced: true, orderId: order.orderId, strategy: "dip_buyer_v2", pending: true, mode: DIP_BUYER_MODE, direction: result.side });
+    log.trades.push({ timestamp: new Date().toISOString(), symbol: asset.symbol, side: isShort ? "sell" : "buy", price: limitPrice, orderPlaced: true, orderId: order.orderId, strategy: "dip_buyer_v2", pending: true, mode: DIP_BUYER_MODE, direction: result.side, entry: true });
     recordDipBuyerPendingLimit(asset.symbol, price, limitPrice, tradeSize, order.orderId, stopPrice, DIP_BUYER_MODE, lev, result.side, tpPrice);
 
     const riskUsd = (risk / limitPrice) * notional;
@@ -1886,12 +1890,72 @@ async function processDipBuyer(asset, log) {
   }
 }
 
+// Query Bybit for actual open positions on all linear symbols.
+// Returns a Set of symbols that still have a non-zero position on Bybit.
+async function getBybitOpenSymbols() {
+  try {
+    const timestamp = Date.now().toString();
+    const params    = "category=linear&settleCoin=USDT";
+    const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/list?${params}`, {
+      headers: {
+        "X-BAPI-API-KEY":    CONFIG.bybit.apiKey,
+        "X-BAPI-SIGN":       signBybit(timestamp, params),
+        "X-BAPI-TIMESTAMP":  timestamp,
+        "X-BAPI-RECV-WINDOW":"5000",
+      },
+    });
+    const data = await res.json();
+    if (data.retCode !== 0) return null;
+    // Return symbols where size > 0 (actually open position on exchange)
+    const open = new Set(
+      (data.result?.list || [])
+        .filter(p => parseFloat(p.size) > 0)
+        .map(p => p.symbol)
+    );
+    return open;
+  } catch { return null; }
+}
+
 async function checkDipBuyerPositions(log) {
   const positions = loadPositions();
   const open = positions.filter((p) => p.status === "open" && p.strategy === "dip_buyer");
   if (!open.length) return;
 
   console.log(`\n─── Dip-Buyer Exit Manager (${open.length} open) ─────────────`);
+
+  // BUG FIX: Sync with Bybit to detect positions closed by exchange-native SL/TP.
+  // If the exchange fired SL or TP while the bot was offline/between scans, positions.json
+  // would show "open" forever → permanently blocking new entries via concurrent limit.
+  const bybitOpen = await getBybitOpenSymbols();
+  if (bybitOpen !== null) {
+    for (const pos of open) {
+      if (pos.mode !== "linear") continue;  // only futures can have native SL/TP
+      if (!bybitOpen.has(pos.symbol)) {
+        // Position closed on exchange but still "open" in our records — mark it closed.
+        console.log(`  ⚠️  ${pos.symbol} [${pos.side}]: NOT found on Bybit (exchange SL/TP fired) — marking closed`);
+        pos.status      = "closed";
+        pos.closeReason = "exchange_sl_tp";
+        pos.closeTime   = new Date().toISOString();
+        pos.closePrice  = pos.dipTp ?? pos.dipStop ?? pos.entry;  // best guess
+        // Rough P&L estimate (actual was handled by exchange)
+        const pnlGuess = pos.side === "short"
+          ? (pos.entry - (pos.closePrice)) / pos.entry * (pos.size * (pos.leverage || 1))
+          : ((pos.closePrice) - pos.entry) / pos.entry * (pos.size * (pos.leverage || 1));
+        pos.pnl = pnlGuess;
+        log.trades.push({ timestamp: new Date().toISOString(), symbol: pos.symbol, side: pos.side, price: pos.closePrice, orderPlaced: false, reason: "exchange_sl_tp_detected" });
+        await tg(
+`🔄 <b>Position reconciled — ${pos.symbol}</b>
+Exchange closed this position via native SL/TP while bot was between scans.
+📍 Entry:  $${pos.entry}
+📤 Close:  $${pos.closePrice?.toFixed(4)} (estimated)
+📋 Side:   ${pos.side?.toUpperCase()} | ${pos.mode}
+✅ Record updated — slot freed for new entries.
+🕐 ${uaeTime()}`
+        );
+      }
+    }
+    savePositions(positions);
+  }
   for (const pos of open) {
     const okxSymbol = pos.symbol.replace("USDT", "-USDT");
     let candles;
@@ -1911,17 +1975,21 @@ async function checkDipBuyerPositions(log) {
     const pct = ((price - pos.entry) / pos.entry) * 100;
     const dipTp = pos.dipTp || null;   // V2: exchange-native TP level (null for V1 positions)
     let exitReason = null;
+    const isV2 = dipTp != null;  // V2 positions always have an exchange-native TP set
     if (posSide === "long") {
       // LONG exits (priority order):
       if (stop != null && price <= stop)            exitReason = "stop_loss";
       else if (dipTp != null && price >= dipTp)     exitReason = "tp3x";           // V2: 3:1 TP hit
-      else if (sma5 != null && price > sma5)        exitReason = "recovery_sma5";  // V1 fallback
+      // BUG FIX: SMA5 exit only applies to V1 positions (no dipTp). V2 enters at
+      // candle LOW; the close is already above SMA5, so this exit fires immediately
+      // and wrongly — closing positions at a loss right after entry (NEAR -$68 case).
+      else if (!isV2 && sma5 != null && price > sma5)  exitReason = "recovery_sma5";  // V1 fallback only
       else if (ageHrs >= (pos.maxHoldHrs || 24))    exitReason = "max_hold";
     } else {
       // SHORT exits (priority order):
       if (stop != null && price >= stop)            exitReason = "stop_loss";
       else if (dipTp != null && price <= dipTp)     exitReason = "tp3x";           // V2: 3:1 TP hit
-      else if (sma5 != null && price < sma5)        exitReason = "recovery_sma5";  // V1 fallback
+      else if (!isV2 && sma5 != null && price < sma5)  exitReason = "recovery_sma5";  // V1 fallback only
       else if (ageHrs >= (pos.maxHoldHrs || 24))    exitReason = "max_hold";
     }
     const tpLabel = dipTp ? ` TP=$${dipTp.toFixed(4)}` : "";
@@ -2246,7 +2314,7 @@ If this gap was unintentional, check Railway logs.`
 🔍 Watching: ${WATCHLIST.map(w => w.symbol.replace("USDT","")).join(" · ")}
 📌 Open positions:
 ${posLines}
-🤖 Scanning every hour. Next ping ~09:00 UAE tomorrow.`
+🤖 Scanning every minute. Next ping ~09:00 UAE tomorrow.`
   );
 
   log.trades.push({ timestamp: now.toISOString(), heartbeatSent: today, orderPlaced: false });
