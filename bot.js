@@ -2425,4 +2425,14 @@ if (process.argv.includes("--tax-summary")) {
   process.exit(0);
 }
 
-run().catch((err) => console.error("Bot error:", err.message));
+const SCAN_INTERVAL_MS = parseInt(process.env.SCAN_INTERVAL_MINUTES || "1") * 60 * 1000;
+
+async function loop() {
+  while (true) {
+    await run().catch((err) => console.error("Bot error:", err.message));
+    console.log(`\n  ⏱ Next scan in ${SCAN_INTERVAL_MS / 60000} minute(s)...\n`);
+    await new Promise(r => setTimeout(r, SCAN_INTERVAL_MS));
+  }
+}
+
+loop();
