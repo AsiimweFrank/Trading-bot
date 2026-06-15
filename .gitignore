@@ -2,3 +2,5 @@
 *.log
 safety-check-log.json
 node_modules/
+positions.json
+trade_log.json
