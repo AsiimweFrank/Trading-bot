@@ -2288,14 +2288,16 @@ async function sendDailySummaryIfDue(log) {
   const pnlStr   = totalPnl >= 0 ? `+$${totalPnl.toFixed(2)}` : `-$${Math.abs(totalPnl).toFixed(2)}`;
   const pnlEmoji = totalPnl >= 0 ? "💚" : "🔴";
 
+  const botLabel = process.env.BOT_LABEL || "V2 (Raw)";
   await tg(
 `📊 <b>Daily Summary — ${uaeTime(now)}</b>
+🤖 <b>${botLabel}</b>
 ${pnlEmoji} P&L:         <b>${pnlStr}</b>
 🎯 Trades:      ${closedPositions.length} closed (${wins}W / ${losses}L)
 📈 Win rate:    ${wr}%
 📂 Open now:   ${openPositions.length} position(s)
 💰 Portfolio:  $${CONFIG.portfolioUSD}
-🤖 Bot:        Running ✅`
+✅ Bot:        Running`
   );
 
   // Mark as sent
@@ -2360,8 +2362,10 @@ If this gap was unintentional, check Railway logs.`
   const closedToday = loadPositions().filter(p => p.status === "closed" && p.closeTime?.startsWith(today));
   const dailyPnl    = closedToday.reduce((s, p) => s + (p.pnl ?? 0), 0);
 
+  const botLabel = process.env.BOT_LABEL || "V2 (Raw)";
   await tg(
 `✅ <b>Bot Heartbeat — ${uaeDate}</b>
+🤖 <b>${botLabel}</b>
 🕐 ${uaeTime()}
 📊 Mode: LIVE | $${CONFIG.portfolioUSD.toLocaleString()} account
 💰 Today's P&L: ${dailyPnl >= 0 ? "+" : ""}$${dailyPnl.toFixed(2)}
@@ -2369,7 +2373,7 @@ If this gap was unintentional, check Railway logs.`
 🔍 Watching: ${WATCHLIST.map(w => w.symbol.replace("USDT","")).join(" · ")}
 📌 Open positions:
 ${posLines}
-🤖 Scanning every minute. Next ping in ~1 hour.`
+⏱ Next ping in ~1 hour.`
   );
 
   log.trades.push({ timestamp: now.toISOString(), heartbeatSent: thisHour, orderPlaced: false });
