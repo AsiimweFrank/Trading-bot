@@ -1796,8 +1796,6 @@ async function processDipBuyer(asset, log) {
   // ── V8 filter: ATR ratio — skip high-volatility candles ──────────────────
   if (V8_ATR_FILTER) {
     const closes250 = candles.map(c => c.close);
-    const highs250  = candles.map(c => c.high);
-    const lows250   = candles.map(c => c.low);
     const trs = candles.map((c, i) => i === 0 ? c.high - c.low :
       Math.max(c.high - c.low, Math.abs(c.high - closes250[i-1]), Math.abs(c.low - closes250[i-1])));
     // ATR14 (Wilder's smoothing)
