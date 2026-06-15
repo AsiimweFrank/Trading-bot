@@ -2349,18 +2349,39 @@ If this gap was unintentional, check Railway logs.`
   const alreadySent = log.trades.some(t => t.heartbeatSent === thisHour);
   if (alreadySent) return;                                       // already sent this hour
 
-  // Gather open position summary for the ping
+  // Gather open positions with live prices for unrealized P&L
   const openPos = loadPositions().filter(p => p.status === "open" || p.status === "pending_limit");
-  const posLines = openPos.length
-    ? openPos.map(p => {
-        if (p.status === "pending_limit") return `  ⏳ ${p.symbol} limit @ $${p.limitPrice?.toFixed(4)} (pending)`;
-        return `  📌 ${p.symbol} @ $${p.entry} [${p.strategy}]`;
-      }).join("\n")
-    : "  None";
+  let totalUnrealized = 0;
+  const posLineArr = [];
+  for (const p of openPos) {
+    if (p.status === "pending_limit") {
+      posLineArr.push(`  ⏳ ${p.symbol} limit @ $${p.limitPrice?.toFixed(4)} (pending)`);
+      continue;
+    }
+    try {
+      const candles  = await fetchCandles(p.okxSymbol || WATCHLIST.find(w => w.symbol === p.symbol)?.okx || p.symbol.replace("USDT","-USDT"), "1H", 2);
+      const livePrice = candles[candles.length - 1].close;
+      const side      = p.side || "long";
+      const notional  = p.size || 0;
+      const lev       = p.leverage || DIP_BUYER_LEVERAGE;
+      const priceDiff = side === "long" ? livePrice - p.entry : p.entry - livePrice;
+      const pnlUsd    = (priceDiff / p.entry) * notional * lev;
+      totalUnrealized += pnlUsd;
+      const pnlStr    = (pnlUsd >= 0 ? "+" : "") + "$" + pnlUsd.toFixed(2);
+      const emoji     = pnlUsd >= 0 ? "🟢" : "🔴";
+      const dp        = livePrice > 100 ? 2 : livePrice > 1 ? 4 : 6;
+      posLineArr.push(`  ${emoji} ${p.symbol} @ $${p.entry} → $${livePrice.toFixed(dp)} | uPnL: <b>${pnlStr}</b>`);
+    } catch {
+      posLineArr.push(`  📌 ${p.symbol} @ $${p.entry} (price unavailable)`);
+    }
+  }
+  const posLines = posLineArr.length ? posLineArr.join("\n") : "  None";
 
   const todayTrades = log.trades.filter(t => t.timestamp?.startsWith(today) && t.orderPlaced);
   const closedToday = loadPositions().filter(p => p.status === "closed" && p.closeTime?.startsWith(today));
   const dailyPnl    = closedToday.reduce((s, p) => s + (p.pnl ?? 0), 0);
+  const totalPnlStr = (dailyPnl >= 0 ? "+" : "") + "$" + dailyPnl.toFixed(2);
+  const uPnlStr     = (totalUnrealized >= 0 ? "+" : "") + "$" + totalUnrealized.toFixed(2);
 
   const botLabel = process.env.BOT_LABEL || "V2 (Raw)";
   await tg(
@@ -2368,10 +2389,11 @@ If this gap was unintentional, check Railway logs.`
 🤖 <b>${botLabel}</b>
 🕐 ${uaeTime()}
 📊 Mode: LIVE | $${CONFIG.portfolioUSD.toLocaleString()} account
-💰 Today's P&L: ${dailyPnl >= 0 ? "+" : ""}$${dailyPnl.toFixed(2)}
+💰 Realised P&L today: <b>${totalPnlStr}</b>
+📉 Unrealised P&L:     <b>${uPnlStr}</b>
 📈 Trades today: ${todayTrades.length}
 🔍 Watching: ${WATCHLIST.map(w => w.symbol.replace("USDT","")).join(" · ")}
-📌 Open positions:
+📌 Open positions (${openPos.length}):
 ${posLines}
 ⏱ Next ping in ~1 hour.`
   );
