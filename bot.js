@@ -2341,18 +2341,17 @@ If this gap was unintentional, check Railway logs.`
   log.trades.push({ timestamp: now.toISOString(), botRun: true, orderPlaced: false });
   saveLog(log);   // ← persist heartbeat on EVERY scan so gap detector always has fresh data
 
-  // ── B) Daily "alive" ping — once per day after 09:00 UAE ────────────────────
+  // ── B) Hourly "alive" ping ───────────────────────────────────────────────
   const uaeHour    = (now.getUTCHours() + 4) % 24;
-  if (uaeHour < 9) return;                                      // too early
-  const alreadySent = log.trades.some(t => t.heartbeatSent === today);
-  if (alreadySent) return;                                       // already sent today
+  const thisHour   = today + "T" + String(uaeHour).padStart(2, "0");
+  const alreadySent = log.trades.some(t => t.heartbeatSent === thisHour);
+  if (alreadySent) return;                                       // already sent this hour
 
   // Gather open position summary for the ping
   const openPos = loadPositions().filter(p => p.status === "open" || p.status === "pending_limit");
   const posLines = openPos.length
     ? openPos.map(p => {
         if (p.status === "pending_limit") return `  ⏳ ${p.symbol} limit @ $${p.limitPrice?.toFixed(4)} (pending)`;
-        const pct = p.entry ? ((0) / p.entry * 100).toFixed(2) : "?";  // price not fetched here
         return `  📌 ${p.symbol} @ $${p.entry} [${p.strategy}]`;
       }).join("\n")
     : "  None";
@@ -2370,12 +2369,12 @@ If this gap was unintentional, check Railway logs.`
 🔍 Watching: ${WATCHLIST.map(w => w.symbol.replace("USDT","")).join(" · ")}
 📌 Open positions:
 ${posLines}
-🤖 Scanning every minute. Next ping ~09:00 UAE tomorrow.`
+🤖 Scanning every minute. Next ping in ~1 hour.`
   );
 
-  log.trades.push({ timestamp: now.toISOString(), heartbeatSent: today, orderPlaced: false });
+  log.trades.push({ timestamp: now.toISOString(), heartbeatSent: thisHour, orderPlaced: false });
   saveLog(log);
-  console.log(`  💓 Daily heartbeat sent to Telegram`);
+  console.log(`  💓 Hourly heartbeat sent to Telegram`);
 }
 
 // Handle --tax-summary flag
