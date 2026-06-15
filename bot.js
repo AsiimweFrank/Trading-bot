@@ -2274,25 +2274,39 @@ Bot resumes automatically tomorrow. 🔄`
 }
 
 // ─── #4 Daily P&L Summary ────────────────────────────────────────────────────
+// Persist sent-date across Railway redeploys using a small state file
+const SUMMARY_STATE_FILE = `${DATA_DIR ? DATA_DIR + "/" : ""}summary-state.json`;
+function loadSummaryState() {
+  try { return JSON.parse(readFileSync(SUMMARY_STATE_FILE, "utf8")); } catch { return {}; }
+}
+function saveSummaryState(state) {
+  try { writeFileSync(SUMMARY_STATE_FILE, JSON.stringify(state)); } catch (_) {}
+}
+
 async function sendDailySummaryIfDue(log) {
-  const now   = new Date();
-  const uaeHour = (now.getUTCHours() + 4) % 24; // UAE = UTC+4
+  const now     = new Date();
+  const uaeHour = (now.getUTCHours() + 4) % 24;
   if (uaeHour < 9) return; // only after 09:00 UAE
 
   const today = now.toISOString().slice(0, 10);
-  const alreadySent = log.trades.some(t => t.dailySummarySent === today);
-  if (alreadySent) return;
 
-  // Gather today's closed trades from CSV
-  const closedToday = (log.trades || []).filter(t =>
-    t.timestamp?.startsWith(today) && t.orderPlaced
-  );
-  const openPositions = loadPositions().filter(p => p.status === "open");
+  // Check persistent state file first (survives Railway redeploys within same volume)
+  // then fall back to in-memory log check
+  const state = loadSummaryState();
+  if (state.sentDate === today) return;
+  if (log.trades.some(t => t.dailySummarySent === today)) return;
 
-  // Compute P&L from positions closed today
-  const closedPositions = loadPositions().filter(p =>
+  // Read positions — use file if it has data, otherwise skip (Railway just restarted)
+  const allPositions   = loadPositions();
+  const closedPositions = allPositions.filter(p =>
     p.status === "closed" && p.closeTime?.startsWith(today) && p.pnl != null
   );
+  const openPositions  = allPositions.filter(p => p.status === "open");
+
+  // Don't send a $0 summary on fresh Railway restart — wait until at least 1 trade exists
+  const entryTradesLogged = log.trades.filter(t => t.timestamp?.startsWith(today) && t.orderPlaced).length;
+  if (closedPositions.length === 0 && entryTradesLogged === 0) return;
+
   const totalPnl = closedPositions.reduce((s, p) => s + p.pnl, 0);
   const wins     = closedPositions.filter(p => p.pnl > 0).length;
   const losses   = closedPositions.filter(p => p.pnl <= 0).length;
@@ -2312,7 +2326,8 @@ ${pnlEmoji} P&L:         <b>${pnlStr}</b>
 ✅ Bot:        Running`
   );
 
-  // Mark as sent
+  // Mark as sent in both places
+  saveSummaryState({ sentDate: today });
   log.trades.push({ timestamp: now.toISOString(), dailySummarySent: today, orderPlaced: false });
   saveLog(log);
 }
