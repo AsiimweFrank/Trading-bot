@@ -24,14 +24,14 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const SCANNER_LABEL    = "📡 4H Scanner";
 
 const WATCHLIST = [
-  "BTC-USDT",
-  "ETH-USDT",
-  "SOL-USDT",
-  "BNB-USDT",
-  "XRP-USDT",
-  "NEAR-USDT",
-  "AVAX-USDT",
-  "TRX-USDT",
+  "BTCUSDT",
+  "ETHUSDT",
+  "SOLUSDT",
+  "BNBUSDT",
+  "XRPUSDT",
+  "NEARUSDT",
+  "AVAXUSDT",
+  "TRXUSDT",
 ];
 
 // Track which 4H candle we already alerted, per symbol+side
@@ -43,8 +43,8 @@ const openAdvisory = new Map();
 
 let lastSummaryDay = -1; // UAE day of last morning summary
 
-// ─── OKX data ─────────────────────────────────────────────────────────────────
-function okxGet(url) {
+// ─── Bybit data ───────────────────────────────────────────────────────────────
+function apiGet(url) {
   return new Promise((resolve, reject) => {
     https.get(url, { headers: { "User-Agent": "Scanner4H/1.0" } }, (res) => {
       let raw = "";
@@ -56,11 +56,11 @@ function okxGet(url) {
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-async function fetchCandles(symbol, bar = "4H", limit = 300) {
-  const url = `https://www.okx.com/api/v5/market/candles?instId=${symbol}&bar=${bar}&limit=${limit}`;
-  const r = await okxGet(url);
-  if (r.code !== "0") throw new Error(`OKX ${symbol}: ${r.msg}`);
-  return r.data
+async function fetchCandles(symbol, interval = "240", limit = 300) {
+  const url = `https://api.bybit.com/v5/market/kline?category=linear&symbol=${symbol}&interval=${interval}&limit=${limit}`;
+  const r = await apiGet(url);
+  if (r.retCode !== 0) throw new Error(`Bybit ${symbol}: ${r.retMsg}`);
+  return r.result.list
     .reverse()
     .map(c => ({
       ts:    Number(c[0]),
@@ -306,7 +306,7 @@ async function scan() {
 
   for (const symbol of WATCHLIST) {
     try {
-      const candles = await fetchCandles(symbol, "4H", 300);
+      const candles = await fetchCandles(symbol, "240", 300);
       const r = analyzeSymbol(candles);
       results[symbol] = r;
 
@@ -360,7 +360,7 @@ async function scan() {
 }
 
 // ─── Boot ──────────────────────────────────────────────────────────────────────
-console.log(`${SCANNER_LABEL} starting — MACD+RSI+SMA200 strategy on 4H`);
+console.log(`${SCANNER_LABEL} starting — MACD+RSI+SMA200 strategy on 4H (Bybit data)`);
 console.log(`Watchlist: ${WATCHLIST.join(", ")}`);
 console.log(`Telegram: ${TELEGRAM_TOKEN ? "configured ✅" : "NOT SET ❌"}`);
 console.log(`Scanning every 5 minutes. Signals fire on 4H candle closes.\n`);
