@@ -35,13 +35,27 @@ const WATCHLIST = [
 ];
 
 // Track which 4H candle we already alerted, per symbol+side
-// key: "ETH-USDT_long_<4H-candle-ts>" → true
 const alertedSignals = new Set();
 // Track open advisory positions (for exit signals)
-// key: "ETH-USDT" → { side, entryTs, entryPrice, entryRsi }
 const openAdvisory = new Map();
 
-let lastSummaryDay = -1; // UAE day of last morning summary
+let lastSummaryDay = -1;
+
+// Daily trade counter — resets at midnight UAE
+const dailyLog = { day: -1, signals: [], exits: [] };
+
+function uaeDay() {
+  return Number(new Date().toLocaleString("en-GB", { timeZone: "Asia/Dubai", day: "2-digit" }));
+}
+
+function resetDailyLogIfNeeded() {
+  const d = uaeDay();
+  if (dailyLog.day !== d) {
+    dailyLog.day = d;
+    dailyLog.signals = [];
+    dailyLog.exits   = [];
+  }
+}
 
 // ─── Bybit data ───────────────────────────────────────────────────────────────
 function apiGet(url) {
@@ -309,6 +323,19 @@ function formatMorningSummary(results) {
   if (bears.length)   { lines.push("*❌ Bearish alignment (SHORT bias):*");   bears.forEach(l => lines.push(l));   lines.push(""); }
   if (neutral.length) { lines.push("*⚡ Mixed / Watch for crossover:*"); neutral.forEach(l => lines.push(l)); lines.push(""); }
 
+  // Yesterday's trade count
+  const prevSignals = dailyLog.signals.length;
+  const prevExits   = dailyLog.exits.length;
+  if (prevSignals > 0 || prevExits > 0) {
+    lines.push(`*📋 Yesterday's Activity:*`);
+    lines.push(`Signals fired: ${prevSignals} | Exits triggered: ${prevExits}`);
+    dailyLog.signals.forEach(s => lines.push(`  • ${s.side.toUpperCase()} ${s.symbol.replace("USDT","/USDT")} @ $${s.price} (${s.time})`));
+    lines.push(``);
+  } else {
+    lines.push(`*📋 Yesterday:* No signals fired`);
+    lines.push(``);
+  }
+
   lines.push(`*💰 Risk per trade:* $${(ACCOUNT_SIZE * RISK_PCT).toFixed(0)} (2% of $${ACCOUNT_SIZE})`);
   lines.push(`_Signal fires on MACD cross + RSI filter + SMA200 confirmation._`);
   lines.push(`_Advisory only. Not financial advice._`);
@@ -341,11 +368,12 @@ function sendTelegram(text) {
 
 // ─── Main scan ─────────────────────────────────────────────────────────────────
 async function scan() {
-  const now    = new Date();
+  const now     = new Date();
   const uaeHour = Number(now.toLocaleString("en-GB", { timeZone: "Asia/Dubai", hour: "2-digit" }));
   const uaeDay  = Number(now.toLocaleString("en-GB", { timeZone: "Asia/Dubai", day: "2-digit" }));
 
-  console.log(`[${now.toISOString()}] Scanning ${WATCHLIST.length} coins on 4H...`);
+  resetDailyLogIfNeeded();
+  console.log(`[${now.toISOString()}] Scanning ${WATCHLIST.length} coins on 4H... (today: ${dailyLog.signals.length} signals, ${dailyLog.exits.length} exits)`);
 
   const results = {};
 
@@ -367,7 +395,8 @@ async function scan() {
           const msg = formatSignalAlert(symbol, r, r.newSignal);
           await sendTelegram(msg);
 
-          // Track open advisory position
+          // Log to daily counter
+          dailyLog.signals.push({ symbol, side: r.newSignal, price: r.price, time: uaeTime() });
           openAdvisory.set(symbol, { side: r.newSignal, entryPrice: r.price, entryTs: Date.now() });
         }
       }
@@ -385,6 +414,9 @@ async function scan() {
             alertedSignals.add(exitKey);
             openAdvisory.delete(symbol);
             await sendTelegram(formatExitAlert(symbol, pos.side, r));
+
+            // Log exit to daily counter
+            dailyLog.exits.push({ symbol, side: pos.side, price: r.price, time: uaeTime() });
           }
         }
       }
