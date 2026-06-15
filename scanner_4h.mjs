@@ -196,37 +196,64 @@ function uaeTime() {
   });
 }
 
+// ─── Risk Manager ─────────────────────────────────────────────────────────────
+const ACCOUNT_SIZE = 500;
+const RISK_PCT     = 0.02; // 2% per trade = $10
+
+function calcPositionSize(entry, stop) {
+  const riskDollar = ACCOUNT_SIZE * RISK_PCT;
+  const stopDist   = Math.abs(entry - stop);
+  const stopPct    = stopDist / entry;
+  const size       = stopPct > 0 ? riskDollar / stopDist : 0;
+  const notional   = size * entry;
+  return { riskDollar, notional: notional.toFixed(2), stopPct: (stopPct * 100).toFixed(2) };
+}
+
+function calcTP(price, stop, side) {
+  const dist = Math.abs(price - stop);
+  return side === "long" ? price + dist * 2 : price - dist * 2; // 1:2 RR minimum
+}
+
 function formatSignalAlert(symbol, r, side) {
-  const coin = symbol.replace("-USDT", "");
+  const coin   = symbol.replace("USDT", "");
   const isLong = side === "long";
-  const emoji = isLong ? "🟢" : "🔴";
-  const dir   = isLong ? "▲ LONG" : "▼ SHORT";
+  const emoji  = isLong ? "🟢" : "🔴";
+  const dir    = isLong ? "▲ LONG" : "▼ SHORT";
 
-  const sl     = isLong ? r.swingLow  : r.swingHigh;
-  const slPct  = (Math.abs(r.price - sl) / r.price * 100).toFixed(2);
+  const sl      = isLong ? r.swingLow : r.swingHigh;
+  const tp      = calcTP(r.price, sl, side);
+  const slPct   = (Math.abs(r.price - sl) / r.price * 100).toFixed(2);
+  const tpPct   = (Math.abs(tp - r.price) / r.price * 100).toFixed(2);
+  const rr      = (Math.abs(tp - r.price) / Math.abs(r.price - sl)).toFixed(1);
+  const { riskDollar, notional, stopPct } = calcPositionSize(r.price, sl);
 
-  const conditions = [
-    `MACD crossed ${isLong ? "above" : "below"} signal ✅`,
-    `RSI ${r.rsi} — ${isLong ? "not overbought (<60)" : "not oversold (>40)"} ✅`,
-    `Price ${isLong ? "above" : "below"} SMA200 ✅`,
-  ].join("\n");
+  const macdDir  = r.macdAboveSignal ? "↑ above signal" : "↓ below signal";
+  const rsiZone  = parseFloat(r.rsi) > 70 ? "⚠️ overbought" : parseFloat(r.rsi) < 30 ? "⚠️ oversold" : "neutral";
 
   return [
     `${SCANNER_LABEL}`,
     `${emoji} *${dir} — ${coin}/USDT*`,
     ``,
-    `Price:  \`$${fmtPrice(r.price)}\``,
-    `Stop:   \`$${fmtPrice(sl)}\` (${slPct}% away)  ← 10-bar swing ${isLong?"low":"high"}`,
-    `Exit:   When MACD crosses back ${isLong?"below":"above"} signal`,
+    `Entry:  \`$${fmtPrice(r.price)}\``,
+    `Stop:   \`$${fmtPrice(sl)}\` (−${slPct}%) ← 10-bar swing ${isLong ? "low" : "high"}`,
+    `Target: \`$${fmtPrice(tp)}\` (+${tpPct}%) — RR 1:${rr}`,
     ``,
-    `${conditions}`,
+    `💰 *Position Size ($500 account, 2% risk)*`,
+    `Risk:     $${riskDollar.toFixed(0)} per trade`,
+    `Size:     $${notional} notional`,
     ``,
+    `📊 *Market Context*`,
+    `Trend:  ${r.trend} (${isLong ? "above" : "below"} SMA200)`,
+    `MACD:   ${macdDir} ✅`,
+    `RSI:    ${r.rsi} — ${rsiZone} ✅`,
+    ``,
+    `Exit:   When MACD crosses back ${isLong ? "below" : "above"} signal`,
     `_Advisory only — you place the trade yourself_`,
   ].join("\n");
 }
 
 function formatExitAlert(symbol, side, r) {
-  const coin   = symbol.replace("-USDT", "");
+  const coin   = symbol.replace("USDT", "");
   const emoji  = side === "long" ? "🟡" : "🟡";
   const dir    = side === "long" ? "LONG" : "SHORT";
   return [
@@ -243,30 +270,48 @@ function formatExitAlert(symbol, side, r) {
 function formatMorningSummary(results) {
   const lines = [
     `${SCANNER_LABEL}`,
-    `*Morning Summary — ${uaeTime()} UAE*`,
+    `*🌅 Morning Briefing — ${uaeTime()} UAE*`,
     ``,
   ];
 
   const bulls = [], bears = [], neutral = [];
+  let bullCount = 0, bearCount = 0;
+  const extremeRSI = [];
 
   for (const [symbol, r] of Object.entries(results)) {
     if (!r) continue;
-    const coin = symbol.replace("-USDT", "");
+    const coin      = symbol.replace("USDT", "");
+    const rsiVal    = parseFloat(r.rsi);
     const macdState = r.macdAboveSignal ? "MACD ↑" : "MACD ↓";
-    const rsiNote   = parseFloat(r.rsi) > 70 ? "⚠️ OB" : parseFloat(r.rsi) < 30 ? "⚠️ OS" : "";
-    const line = `*${coin}* — ${r.trend} | RSI ${r.rsi} ${rsiNote} | ${macdState} | $${fmtPrice(r.price)}`;
+    let rsiNote = "";
+    if (rsiVal > 70) { rsiNote = "⚠️ OB"; extremeRSI.push(`${coin} overbought (${r.rsi})`); }
+    if (rsiVal < 30) { rsiNote = "⚠️ OS"; extremeRSI.push(`${coin} oversold (${r.rsi})`); }
 
-    if (r.trend === "BULL" && r.macdAboveSignal) bulls.push("🟢 " + line);
+    const line = `*${coin}* | $${fmtPrice(r.price)} | RSI ${r.rsi} ${rsiNote} | ${macdState}`;
+
+    if (r.trend === "BULL") { bullCount++; }
+    else { bearCount++; }
+
+    if (r.trend === "BULL" && r.macdAboveSignal)      bulls.push("🟢 " + line);
     else if (r.trend === "BEAR" && !r.macdAboveSignal) bears.push("🔴 " + line);
     else neutral.push("🟡 " + line);
   }
 
-  if (bulls.length)    { lines.push("*Bullish alignment:*"); bulls.forEach(l => lines.push(l)); lines.push(""); }
-  if (bears.length)    { lines.push("*Bearish alignment:*"); bears.forEach(l => lines.push(l)); lines.push(""); }
-  if (neutral.length)  { lines.push("*Mixed / transitioning:*"); neutral.forEach(l => lines.push(l)); lines.push(""); }
+  // Market sentiment overview
+  const total = bullCount + bearCount;
+  const sentiment = bullCount >= 6 ? "Strong Bull 🚀" : bullCount >= 4 ? "Mixed — Leaning Bull" : bearCount >= 6 ? "Strong Bear 🐻" : "Mixed — Leaning Bear";
+  lines.push(`*Market Sentiment:* ${sentiment}`);
+  lines.push(`Bull: ${bullCount}/${total} coins above SMA200 | Bear: ${bearCount}/${total} coins below SMA200`);
+  if (extremeRSI.length) lines.push(`⚠️ Extreme RSI: ${extremeRSI.join(", ")}`);
+  lines.push(``);
 
-  lines.push("_Signal fires when MACD crosses with RSI + SMA200 filter._");
-  lines.push("_Advisory only. Not financial advice._");
+  if (bulls.length)   { lines.push("*✅ Bullish alignment (LONG bias):*");   bulls.forEach(l => lines.push(l));   lines.push(""); }
+  if (bears.length)   { lines.push("*❌ Bearish alignment (SHORT bias):*");   bears.forEach(l => lines.push(l));   lines.push(""); }
+  if (neutral.length) { lines.push("*⚡ Mixed / Watch for crossover:*"); neutral.forEach(l => lines.push(l)); lines.push(""); }
+
+  lines.push(`*💰 Risk per trade:* $${(ACCOUNT_SIZE * RISK_PCT).toFixed(0)} (2% of $${ACCOUNT_SIZE})`);
+  lines.push(`_Signal fires on MACD cross + RSI filter + SMA200 confirmation._`);
+  lines.push(`_Advisory only. Not financial advice._`);
   return lines.join("\n");
 }
 
