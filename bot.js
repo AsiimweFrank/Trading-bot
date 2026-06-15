@@ -1011,20 +1011,27 @@ async function placeLimitBuyLinear(symbol, sizeUSD, leverage, limitPrice, slPric
       tpslMode:      "Full",
     } : {}),
   });
-  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/create`, {
-    method: "POST",
-    headers: {
-      "Content-Type":      "application/json",
-      "X-BAPI-API-KEY":    CONFIG.bybit.apiKey,
-      "X-BAPI-SIGN":       signBybit(timestamp, body),
-      "X-BAPI-TIMESTAMP":  timestamp,
-      "X-BAPI-RECV-WINDOW":"5000",
-    },
-    body,
-  });
-  const data = await res.json();
-  if (data.retCode !== 0) throw new Error(`Bybit error ${data.retCode}: ${data.retMsg}`);
-  return data.result; // { orderId, ... }
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const ts2 = Date.now().toString();
+    const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/create`, {
+      method: "POST",
+      headers: {
+        "Content-Type":      "application/json",
+        "X-BAPI-API-KEY":    CONFIG.bybit.apiKey,
+        "X-BAPI-SIGN":       signBybit(ts2, body),
+        "X-BAPI-TIMESTAMP":  ts2,
+        "X-BAPI-RECV-WINDOW":"5000",
+      },
+      body,
+    });
+    let data;
+    try { data = await res.json(); } catch {
+      if (attempt < 3) { await new Promise(r => setTimeout(r, attempt * 1000)); continue; }
+      throw new Error(`Bybit returned non-JSON response (status ${res.status})`);
+    }
+    if (data.retCode !== 0) throw new Error(`Bybit error ${data.retCode}: ${data.retMsg}`);
+    return data.result;
+  }
 }
 
 // Place a LINEAR (perpetual futures) LIMIT SELL above market — SHORT entry with native SL.
@@ -1058,20 +1065,27 @@ async function placeLimitSellLinear(symbol, sizeUSD, leverage, limitPrice, slPri
       tpslMode:      "Full",
     } : {}),
   });
-  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/create`, {
-    method: "POST",
-    headers: {
-      "Content-Type":      "application/json",
-      "X-BAPI-API-KEY":    CONFIG.bybit.apiKey,
-      "X-BAPI-SIGN":       signBybit(timestamp, body),
-      "X-BAPI-TIMESTAMP":  timestamp,
-      "X-BAPI-RECV-WINDOW":"5000",
-    },
-    body,
-  });
-  const data = await res.json();
-  if (data.retCode !== 0) throw new Error(`Bybit error ${data.retCode}: ${data.retMsg}`);
-  return data.result; // { orderId, ... }
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const ts2 = Date.now().toString();
+    const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/create`, {
+      method: "POST",
+      headers: {
+        "Content-Type":      "application/json",
+        "X-BAPI-API-KEY":    CONFIG.bybit.apiKey,
+        "X-BAPI-SIGN":       signBybit(ts2, body),
+        "X-BAPI-TIMESTAMP":  ts2,
+        "X-BAPI-RECV-WINDOW":"5000",
+      },
+      body,
+    });
+    let data;
+    try { data = await res.json(); } catch {
+      if (attempt < 3) { await new Promise(r => setTimeout(r, attempt * 1000)); continue; }
+      throw new Error(`Bybit returned non-JSON response (status ${res.status})`);
+    }
+    if (data.retCode !== 0) throw new Error(`Bybit error ${data.retCode}: ${data.retMsg}`);
+    return data.result;
+  }
 }
 
 // Query the status of an order (checks history for closed orders too).
