@@ -379,6 +379,12 @@ const DIP_V2_MAX_CONCURRENT = parseInt(process.env.DIP_V2_MAX_CONCURRENT || "4")
 // V2 requires "linear" (futures) to enable shorts — default to linear now
 const DIP_BUYER_MODE     = process.env.DIP_BUYER_MODE     || "linear";
 const DIP_BUYER_LEVERAGE = parseFloat(process.env.DIP_BUYER_LEVERAGE || "3");  // 3× ≈ natural leverage from 0.3% stop
+// V8 filters — enable via env vars to run V8 alongside raw V2 on a separate deployment
+const V8_BTC_MACRO_GATE  = process.env.V8_BTC_MACRO_GATE === "true";  // block when BTC daily < SMA200
+const V8_ATR_FILTER      = process.env.V8_ATR_FILTER     === "true";  // block when ATR14 > 1.5× its 50-bar avg
+
+// Module-level — populated once per run() if V8_BTC_MACRO_GATE is enabled
+let _btcDailyBull = null;  // true = BTC above daily SMA200, false = below, null = not fetched
 // Bybit fee rates (used in P&L accounting)
 const FEE_SPOT_MAKER     = 0.0002;   // 0.02% spot maker (limit below market)
 const FEE_SPOT_TAKER     = 0.001;    // 0.10% spot taker (market order)
@@ -1781,6 +1787,41 @@ async function processDipBuyer(asset, log) {
 
   if (!result.signal) { console.log(`  ⏸  No signal — ${result.reason}`); return false; }
 
+  // ── V8 filter: BTC daily macro gate ──────────────────────────────────────
+  if (V8_BTC_MACRO_GATE && _btcDailyBull !== null) {
+    if (result.side === "long"  && !_btcDailyBull) { console.log(`  🔴 V8 BLOCKED — BTC below daily SMA200 (bear market), no longs`); return false; }
+    if (result.side === "short" &&  _btcDailyBull) { console.log(`  🟢 V8 BLOCKED — BTC above daily SMA200 (bull market), no shorts`); return false; }
+  }
+
+  // ── V8 filter: ATR ratio — skip high-volatility candles ──────────────────
+  if (V8_ATR_FILTER) {
+    const closes250 = candles.map(c => c.close);
+    const highs250  = candles.map(c => c.high);
+    const lows250   = candles.map(c => c.low);
+    const trs = candles.map((c, i) => i === 0 ? c.high - c.low :
+      Math.max(c.high - c.low, Math.abs(c.high - closes250[i-1]), Math.abs(c.low - closes250[i-1])));
+    // ATR14 (Wilder's smoothing)
+    const atr14arr = new Array(candles.length).fill(null);
+    let atrVal = trs.slice(1, 15).reduce((s, v) => s + v, 0) / 14;
+    atr14arr[14] = atrVal;
+    for (let i = 15; i < candles.length; i++) { atrVal = (atrVal * 13 + trs[i]) / 14; atr14arr[i] = atrVal; }
+    // SMA50 of ATR14
+    let atrSum = 0, atrCount = 0;
+    for (let i = 0; i < candles.length; i++) {
+      if (atr14arr[i] === null) continue;
+      atrSum += atr14arr[i]; atrCount++;
+      if (atrCount > 50) atrSum -= atr14arr[i - 50];
+    }
+    const lastAtr  = atr14arr[atr14arr.length - 1];
+    const atrAvg50 = atrCount >= 50 ? atrSum / 50 : null;
+    const atrRatio = lastAtr && atrAvg50 ? lastAtr / atrAvg50 : null;
+    if (atrRatio !== null && atrRatio > 1.5) {
+      console.log(`  ⚡ V8 BLOCKED — ATR ratio ${atrRatio.toFixed(2)} > 1.5 (high volatility — skip)`);
+      return false;
+    }
+    if (atrRatio !== null) console.log(`  ✅ V8 ATR ratio: ${atrRatio.toFixed(2)} (< 1.5 — OK)`);
+  }
+
   // signal = "buy" (long dip) or "sell" (short spike)
   const isShort   = result.side === "short";
   const dirLabel  = isShort ? "SHORT" : "BUY";
@@ -2153,6 +2194,21 @@ Bot resumes automatically tomorrow. 🔄`
     }
   } catch (e) {
     console.log(`  ⚠️  BTC regime check failed: ${e.message}`);
+  }
+
+  // ── V8: BTC daily macro gate — fetch once per run ────────────────────────
+  if (V8_BTC_MACRO_GATE) {
+    try {
+      const btcDaily  = await fetchCandles("BTC-USDT", "1D", 210);
+      const dc        = btcDaily.map(c => c.close);
+      const dSma200   = calcSMA(dc, 200);
+      const dLast     = dc[dc.length - 1];
+      _btcDailyBull   = dSma200 !== null && dLast > dSma200;
+      console.log(`\n  📊 V8 BTC Daily: $${dLast.toFixed(0)} vs SMA200=$${dSma200?.toFixed(0)} → ${_btcDailyBull ? "🟢 BULL — longs allowed" : "🔴 BEAR — longs blocked"}`);
+    } catch (e) {
+      console.log(`  ⚠️  V8 BTC daily fetch failed: ${e.message} — macro gate skipped`);
+      _btcDailyBull = null;
+    }
   }
 
   // ── Step 1a: Check open Hermes positions (perpetual TP/SL exits) ─────────
