@@ -1226,9 +1226,9 @@ async function checkHermesPositions(log) {
       continue;
     }
 
-    // VWAP positions have sl=null — skip here, handled by checkVwapPositions
-    if (pos.sl === null && pos.tp1 === null) {
-      console.log(`  ⏭️  ${pos.symbol} (VWAP) — exit managed by VWAP Exit Manager`);
+    // VWAP/dip_buyer positions have sl=null/undefined — skip here, each has its own exit manager
+    if (pos.sl == null && pos.tp1 == null) {
+      // dip_buyer positions use dipStop/dipTp; VWAP positions use VWAP Exit Manager
       continue;
     }
 
