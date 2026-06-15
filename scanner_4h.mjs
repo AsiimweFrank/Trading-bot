@@ -215,7 +215,7 @@ function calcTP(price, stop, side) {
 }
 
 function formatSignalAlert(symbol, r, side) {
-  const coin   = symbol.replace("USDT", "");
+  const coin   = symbol.replace("USDT", "/USDT");
   const isLong = side === "long";
   const emoji  = isLong ? "🟢" : "🔴";
   const dir    = isLong ? "▲ LONG" : "▼ SHORT";
@@ -253,7 +253,7 @@ function formatSignalAlert(symbol, r, side) {
 }
 
 function formatExitAlert(symbol, side, r) {
-  const coin   = symbol.replace("USDT", "");
+  const coin   = symbol.replace("USDT", "/USDT");
   const emoji  = side === "long" ? "🟡" : "🟡";
   const dir    = side === "long" ? "LONG" : "SHORT";
   return [
