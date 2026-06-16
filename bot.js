@@ -2056,6 +2056,33 @@ async function getBybitOpenSymbols() {
   } catch { return null; }
 }
 
+// Query Bybit's actual closed-PnL record for a symbol — gives the REAL exit price
+// and REAL realized P&L instead of guessing TP vs SL when a position disappears
+// from the open-positions list between scans.
+async function getBybitClosedPnl(symbol) {
+  try {
+    const timestamp = Date.now().toString();
+    const params    = `category=linear&symbol=${symbol}&limit=1`;
+    const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/closed-pnl?${params}`, {
+      headers: {
+        "X-BAPI-API-KEY":    CONFIG.bybit.apiKey,
+        "X-BAPI-SIGN":       signBybit(timestamp, params),
+        "X-BAPI-TIMESTAMP":  timestamp,
+        "X-BAPI-RECV-WINDOW":"5000",
+      },
+    });
+    const data = await res.json();
+    if (data.retCode !== 0) return null;
+    const rec = data.result?.list?.[0];
+    if (!rec) return null;
+    return {
+      closePrice: parseFloat(rec.avgExitPrice),
+      pnl:        parseFloat(rec.closedPnl),
+      closedTime: parseInt(rec.updatedTime || rec.createdTime),
+    };
+  } catch { return null; }
+}
+
 async function checkDipBuyerPositions(log) {
   const positions = loadPositions();
   const open = positions.filter((p) => p.status === "open" && p.strategy === "dip_buyer");
@@ -2072,22 +2099,34 @@ async function checkDipBuyerPositions(log) {
       if (pos.mode !== "linear") continue;  // only futures can have native SL/TP
       if (!bybitOpen.has(pos.symbol)) {
         // Position closed on exchange but still "open" in our records — mark it closed.
-        console.log(`  ⚠️  ${pos.symbol} [${pos.side}]: NOT found on Bybit (exchange SL/TP fired) — marking closed`);
-        pos.status      = "closed";
-        pos.closeReason = "exchange_sl_tp";
-        pos.closeTime   = new Date().toISOString();
-        pos.closePrice  = pos.dipTp ?? pos.dipStop ?? pos.entry;  // best guess
-        // Rough P&L estimate (actual was handled by exchange)
-        const pnlGuess = pos.side === "short"
-          ? (pos.entry - (pos.closePrice)) / pos.entry * (pos.size * (pos.leverage || 1))
-          : ((pos.closePrice) - pos.entry) / pos.entry * (pos.size * (pos.leverage || 1));
-        pos.pnl = pnlGuess;
-        log.trades.push({ timestamp: new Date().toISOString(), symbol: pos.symbol, side: pos.side, price: pos.closePrice, orderPlaced: false, reason: "exchange_sl_tp_detected" });
+        console.log(`  ⚠️  ${pos.symbol} [${pos.side}]: NOT found on Bybit (exchange SL/TP fired) — reconciling`);
+        const real = await getBybitClosedPnl(pos.symbol);
+        pos.status    = "closed";
+        pos.closeTime = new Date().toISOString();
+
+        if (real) {
+          // Real numbers from Bybit's own closed-PnL record — no guessing.
+          pos.closePrice  = real.closePrice;
+          pos.pnl         = real.pnl;
+          pos.closeReason = real.pnl >= 0 ? "exchange_tp" : "exchange_sl";
+        } else {
+          // API lookup failed — fall back to the old best-guess (assumes TP), but
+          // flag it clearly as an estimate so it doesn't get mistaken for a real fill.
+          pos.closeReason = "exchange_unknown_estimated";
+          pos.closePrice  = pos.dipTp ?? pos.dipStop ?? pos.entry;
+          pos.pnl = pos.side === "short"
+            ? (pos.entry - pos.closePrice) / pos.entry * (pos.size * (pos.leverage || 1))
+            : (pos.closePrice - pos.entry) / pos.entry * (pos.size * (pos.leverage || 1));
+        }
+
+        log.trades.push({ timestamp: new Date().toISOString(), symbol: pos.symbol, side: pos.side, price: pos.closePrice, orderPlaced: false, reason: pos.closeReason });
+        const pnlLine = pos.pnl >= 0 ? `+$${pos.pnl.toFixed(2)}` : `-$${Math.abs(pos.pnl).toFixed(2)}`;
         await tg(
 `🔄 <b>Position reconciled — ${pos.symbol}</b>
-Exchange closed this position via native SL/TP while bot was between scans.
+Exchange closed this position via native ${pos.closeReason === "exchange_sl" ? "STOP LOSS 🔴" : pos.closeReason === "exchange_tp" ? "TAKE PROFIT 💚" : "SL/TP (unconfirmed)"} while bot was between scans.
 📍 Entry:  $${pos.entry}
-📤 Close:  $${pos.closePrice?.toFixed(4)} (estimated)
+📤 Close:  $${pos.closePrice?.toFixed(4)}${real ? "" : " (estimated)"}
+💰 P&L:    ${pnlLine}
 📋 Side:   ${pos.side?.toUpperCase()} | ${pos.mode}
 ✅ Record updated — slot freed for new entries.
 🕐 ${uaeTime()}`
