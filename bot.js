@@ -1207,10 +1207,14 @@ async function sendStatusReport() {
   const closedToday  = allPositions.filter(p => p.status === "closed" && p.closeTime?.startsWith(today) && p.pnl != null);
   const closedAll    = allPositions.filter(p => p.status === "closed" && p.pnl != null);
 
-  const todayPnl = closedToday.reduce((s, p) => s + p.pnl, 0);
-  const allPnl   = closedAll.reduce((s, p) => s + p.pnl, 0);
-  const wins     = closedAll.filter(p => p.pnl > 0).length;
-  const wr       = closedAll.length > 0 ? (wins / closedAll.length * 100).toFixed(0) : "—";
+  const todayPnl   = closedToday.reduce((s, p) => s + p.pnl, 0);
+  const todayWins  = closedToday.filter(p => p.pnl > 0).length;
+  const todayLoss  = closedToday.filter(p => p.pnl <= 0).length;
+
+  const allPnl     = closedAll.reduce((s, p) => s + p.pnl, 0);
+  const wins       = closedAll.filter(p => p.pnl > 0).length;
+  const losses     = closedAll.filter(p => p.pnl <= 0).length;
+  const wr         = closedAll.length > 0 ? (wins / closedAll.length * 100).toFixed(0) : "—";
 
   const openLines = open.length
     ? open.map(p => `  • ${p.symbol} ${p.side.toUpperCase()} @ $${p.entry} (${p.strategy})`).join("\n")
@@ -1225,8 +1229,11 @@ async function sendStatusReport() {
 📂 <b>Open positions (${open.length}):</b>
 ${openLines}
 
-💰 Today P&L: <b>${todayPnl >= 0 ? "+" : ""}$${todayPnl.toFixed(2)}</b> (${closedToday.length} closed)
-📈 All-time P&L: <b>${allPnl >= 0 ? "+" : ""}$${allPnl.toFixed(2)}</b> (${closedAll.length} closed, ${wr}% WR)`
+💰 Today P&L: <b>${todayPnl >= 0 ? "+" : ""}$${todayPnl.toFixed(2)}</b>
+🎯 Today trades: ${closedToday.length} (${todayWins}W / ${todayLoss}L)
+
+📈 All-time P&L: <b>${allPnl >= 0 ? "+" : ""}$${allPnl.toFixed(2)}</b>
+🎯 All-time trades: ${closedAll.length} (${wins}W / ${losses}L) — ${wr}% WR`
   );
 }
 
