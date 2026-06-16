@@ -1163,6 +1163,73 @@ function writeTradeCsv({ symbol, strategy, side, price, tradeSize, orderId, mode
   appendFileSync(CSV_FILE, row + "\n");
 }
 
+// ─── On-demand Telegram /status command ──────────────────────────────────────
+// DM the bot "/status" anytime — next scan (within 60s) replies with positions + P&L.
+const TG_OFFSET_FILE = `${DATA_DIR ? DATA_DIR + "/" : ""}telegram-offset.json`;
+function loadTgOffset() {
+  try { return JSON.parse(readFileSync(TG_OFFSET_FILE, "utf8")).offset || 0; } catch { return 0; }
+}
+function saveTgOffset(offset) {
+  try { writeFileSync(TG_OFFSET_FILE, JSON.stringify({ offset })); } catch (_) {}
+}
+
+async function checkTelegramCommands() {
+  if (!CONFIG.telegram.token || !CONFIG.telegram.chatId) return;
+  try {
+    const offset = loadTgOffset();
+    const url = `https://api.telegram.org/bot${CONFIG.telegram.token}/getUpdates?offset=${offset}&timeout=0`;
+    const res  = await fetch(url);
+    const data = await res.json();
+    if (!data.ok || !data.result?.length) return;
+
+    let maxUpdateId = offset - 1;
+    let statusRequested = false;
+    for (const update of data.result) {
+      maxUpdateId = Math.max(maxUpdateId, update.update_id);
+      const msg = update.message;
+      if (!msg?.text) continue;
+      if (String(msg.chat?.id) !== String(CONFIG.telegram.chatId)) continue;
+      const text = msg.text.trim().toLowerCase().replace(/^\//, "");
+      if (text === "status" || text === "pnl" || text === "positions") statusRequested = true;
+    }
+    saveTgOffset(maxUpdateId + 1);
+
+    if (statusRequested) await sendStatusReport();
+  } catch (e) {
+    console.log(`  ⚠️  Telegram command check failed: ${e.message}`);
+  }
+}
+
+async function sendStatusReport() {
+  const allPositions = loadPositions();
+  const open         = allPositions.filter(p => p.status === "open");
+  const today        = new Date().toISOString().slice(0, 10);
+  const closedToday  = allPositions.filter(p => p.status === "closed" && p.closeTime?.startsWith(today) && p.pnl != null);
+  const closedAll    = allPositions.filter(p => p.status === "closed" && p.pnl != null);
+
+  const todayPnl = closedToday.reduce((s, p) => s + p.pnl, 0);
+  const allPnl   = closedAll.reduce((s, p) => s + p.pnl, 0);
+  const wins     = closedAll.filter(p => p.pnl > 0).length;
+  const wr       = closedAll.length > 0 ? (wins / closedAll.length * 100).toFixed(0) : "—";
+
+  const openLines = open.length
+    ? open.map(p => `  • ${p.symbol} ${p.side.toUpperCase()} @ $${p.entry} (${p.strategy})`).join("\n")
+    : "  none";
+
+  const botLabel = process.env.BOT_LABEL || "V2 (Raw)";
+  await tg(
+`📟 <b>Status Report — ${uaeTime()}</b>
+🤖 <b>${botLabel}</b>
+✅ Bot: Running
+
+📂 <b>Open positions (${open.length}):</b>
+${openLines}
+
+💰 Today P&L: <b>${todayPnl >= 0 ? "+" : ""}$${todayPnl.toFixed(2)}</b> (${closedToday.length} closed)
+📈 All-time P&L: <b>${allPnl >= 0 ? "+" : ""}$${allPnl.toFixed(2)}</b> (${closedAll.length} closed, ${wr}% WR)`
+  );
+}
+
 // ─── Hermes Position Tracker (Partial TP) ────────────────────────────────────
 // Tracks open Hermes shorts: partial exit at 1.5%, full exit at 3.0%, SL 1.5%
 
@@ -2128,6 +2195,9 @@ async function run() {
   }
 
   initCsv();
+
+  // Check for /status command from Telegram before anything else
+  await checkTelegramCommands();
 
   console.log("═══════════════════════════════════════════════════════════");
   console.log("  Claude Trading Bot — Multi-Asset");
