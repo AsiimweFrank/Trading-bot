@@ -145,17 +145,16 @@ function getTradeSize() {
 //   65-68% WR, profitable across 27/27 param combos & 3 OOS periods on BTC/ETH/NEAR.
 //   Old VWAP/Hermes assignments removed (confirmed net-negative over 57d OOS).
 //   NOTE: profitable at fees <0.16% round-trip → maker/limit execution is the next upgrade.
-// V2: All 8 coins — both LONG (RSI2<10+uptrend) and SHORT (RSI2>90+downtrend)
-// Backtest PF by coin: ETH 2.16 | NEAR 2.17 | XRP 2.13 | SOL 2.06 | BTC 1.91 | AVAX 1.91 | BNB 1.75 | TRX 1.32
+// Combo V1: RSI(2)<25 + EMA(13>34) trend filter + BTC daily SMA200 macro gate
+// 6 coins (NEAR + TRX dropped — PF < 1 in backtest)
+// Backtest (12mo, Node.js): PF 1.26, 3.2 trades/day, +$1,174/yr → $10.77/day compounded yr-1
 const WATCHLIST = [
-  { symbol: "BTCUSDT",  okx: "BTC-USDT",  strategy: "dip_buyer" },
-  { symbol: "ETHUSDT",  okx: "ETH-USDT",  strategy: "dip_buyer" },
-  { symbol: "NEARUSDT", okx: "NEAR-USDT", strategy: "dip_buyer" },
-  { symbol: "SOLUSDT",  okx: "SOL-USDT",  strategy: "dip_buyer" },
-  { symbol: "BNBUSDT",  okx: "BNB-USDT",  strategy: "dip_buyer" },
-  { symbol: "XRPUSDT",  okx: "XRP-USDT",  strategy: "dip_buyer" },
-  { symbol: "AVAXUSDT", okx: "AVAX-USDT", strategy: "dip_buyer" },
-  { symbol: "TRXUSDT",  okx: "TRX-USDT",  strategy: "dip_buyer" }, // weakest PF 1.32 — kept for signal volume
+  { symbol: "BTCUSDT",  okx: "BTC-USDT",  strategy: "combo_v1" },
+  { symbol: "ETHUSDT",  okx: "ETH-USDT",  strategy: "combo_v1" },
+  { symbol: "SOLUSDT",  okx: "SOL-USDT",  strategy: "combo_v1" },
+  { symbol: "BNBUSDT",  okx: "BNB-USDT",  strategy: "combo_v1" },
+  { symbol: "XRPUSDT",  okx: "XRP-USDT",  strategy: "combo_v1" },
+  { symbol: "AVAXUSDT", okx: "AVAX-USDT", strategy: "combo_v1" },
 ];
 
 // ── Persistent data directory ─────────────────────────────────────────────────
@@ -445,6 +444,61 @@ function checkStratDipBuyer(candles) {
   if (uptrend)   return { signal: null, reason: `uptrend but RSI2=${rsi2.toFixed(1)} (need <${DIP_RSI_ENTRY})`, indicators };
   if (downtrend) return { signal: null, reason: `downtrend but RSI2=${rsi2.toFixed(1)} (need >${DIP_RSI_SHORT})`, indicators };
   return { signal: null, reason: `no clear trend (SMA200=${sma200.toFixed(2)}, SMA50 ${sma50 > sma50p ? "rising" : "falling"} but price ${price > sma200 ? ">" : "<"} SMA200)`, indicators };
+}
+
+// ─── Strategy Combo V1: RSI(2) + EMA(13,34) trend filter ─────────────────────
+// Backtest (12mo, 6 coins, Node.js Bybit data): PF 1.26, WR 30.4%, +$1,174/yr
+//   Long : RSI(2) < 25  AND  EMA13 > EMA34  AND  BTC daily > SMA200
+//   Short: RSI(2) > 75  AND  EMA13 < EMA34  AND  BTC daily < SMA200
+//   SL: 1.5% fixed from entry | TP: 6.0% (4:1 RR) | Timeout: 72 bars
+const CV1_RSI_LONG  = parseFloat(process.env.CV1_RSI_LONG  || "25");
+const CV1_RSI_SHORT = parseFloat(process.env.CV1_RSI_SHORT || "75");
+const CV1_SL_PCT    = parseFloat(process.env.CV1_SL_PCT    || "0.015");  // 1.5%
+const CV1_TP_PCT    = parseFloat(process.env.CV1_TP_PCT    || "0.060");  // 6.0%
+
+function checkStratComboV1(candles, btcDailyBull) {
+  const closes = candles.map((c) => c.close);
+  const price  = closes[closes.length - 1];
+
+  const ema13 = calcEMA(closes, 13);
+  const ema34 = calcEMA(closes, 34);
+  const rsi2  = calcRSI(closes, 2);
+
+  if (ema13 === null || ema34 === null || rsi2 === null)
+    return { signal: null, reason: "insufficient data" };
+
+  const indicators = { price, ema13, ema34, rsi2, btcBull: btcDailyBull };
+  const emaTrendUp = ema13 > ema34;
+
+  // Long: oversold dip in an uptrend with bullish macro
+  if (rsi2 < CV1_RSI_LONG && emaTrendUp && btcDailyBull === true) {
+    const entry    = price;
+    const stopPrice = entry * (1 - CV1_SL_PCT);
+    const tpPrice   = entry * (1 + CV1_TP_PCT);
+    return {
+      signal: "buy", side: "long",
+      reason: `CV1-LONG  EMA13>EMA34 ↑, RSI2=${rsi2.toFixed(1)}<${CV1_RSI_LONG}, BTC BULL`,
+      stopPrice, tpPrice, limitPrice: entry,
+      indicators,
+    };
+  }
+
+  // Short: overbought spike in a downtrend with bearish macro
+  if (rsi2 > CV1_RSI_SHORT && !emaTrendUp && btcDailyBull === false) {
+    const entry    = price;
+    const stopPrice = entry * (1 + CV1_SL_PCT);
+    const tpPrice   = entry * (1 - CV1_TP_PCT);
+    return {
+      signal: "sell", side: "short",
+      reason: `CV1-SHORT EMA13<EMA34 ↓, RSI2=${rsi2.toFixed(1)}>${CV1_RSI_SHORT}, BTC BEAR`,
+      stopPrice, tpPrice, limitPrice: entry,
+      indicators,
+    };
+  }
+
+  const trend = emaTrendUp ? "↑ EMA uptrend" : "↓ EMA downtrend";
+  const macro = btcDailyBull === true ? "BTC BULL" : btcDailyBull === false ? "BTC BEAR" : "BTC unknown";
+  return { signal: null, reason: `no signal — ${trend}, RSI2=${rsi2.toFixed(1)}, ${macro}`, indicators };
 }
 
 // ─── Strategy B: Hermes v06 — RSI Rejection in Downtrend ─────────────────────
@@ -1393,8 +1447,8 @@ async function checkHermesPositions(log) {
 // ─── Process one asset ────────────────────────────────────────────────────────
 
 async function processAsset(asset, log) {
-  // Route dip-buyer to its own self-contained handler
-  if (asset.strategy === "dip_buyer") return await processDipBuyer(asset, log);
+  // Route dip-buyer and combo_v1 to the same self-contained handler
+  if (asset.strategy === "dip_buyer" || asset.strategy === "combo_v1") return await processDipBuyer(asset, log);
 
   console.log(`\n─── ${asset.symbol} [${asset.strategy}] ─────────────────────`);
 
@@ -1878,18 +1932,27 @@ async function checkDipBuyerPendingOrders(log) {
 }
 
 async function processDipBuyer(asset, log) {
-  console.log(`\n─── ${asset.symbol} [dip_buyer] ─────────────────────`);
+  const stratLabel = asset.strategy || "dip_buyer";
+  console.log(`\n─── ${asset.symbol} [${stratLabel}] ─────────────────────`);
   const candles = await fetchCandles(asset.okx, "1H", 250);   // need 200+ bars for SMA200
   const price   = candles[candles.length - 1].close;
-  const result  = checkStratDipBuyer(candles);
-  const ind     = result.indicators || {};
-  if (ind.rsi2 !== undefined)
+
+  // Combo V1 uses its own signal logic with BTC macro gate baked in
+  const result = asset.strategy === "combo_v1"
+    ? checkStratComboV1(candles, _btcDailyBull)
+    : checkStratDipBuyer(candles);
+
+  const ind = result.indicators || {};
+  if (asset.strategy === "combo_v1") {
+    console.log(`  Price: $${price.toFixed(4)} [1H] | EMA13=$${ind.ema13?.toFixed(2)} EMA34=$${ind.ema34?.toFixed(2)} RSI2=${ind.rsi2?.toFixed(1)} BTC=${ind.btcBull === true ? "BULL" : ind.btcBull === false ? "BEAR" : "?"}`);
+  } else if (ind.rsi2 !== undefined) {
     console.log(`  Price: $${price.toFixed(4)} [1H] | SMA200=$${ind.sma200?.toFixed(2)} SMA50=$${ind.sma50?.toFixed(2)} RSI2=${ind.rsi2?.toFixed(1)}`);
+  }
 
   if (!result.signal) { console.log(`  ⏸  No signal — ${result.reason}`); return false; }
 
-  // ── V8 filter: BTC daily macro gate ──────────────────────────────────────
-  if (V8_BTC_MACRO_GATE && _btcDailyBull !== null) {
+  // ── V8 filter: BTC daily macro gate (dip_buyer only — combo_v1 handles this internally) ──
+  if (asset.strategy !== "combo_v1" && V8_BTC_MACRO_GATE && _btcDailyBull !== null) {
     if (result.side === "long"  && !_btcDailyBull) { console.log(`  🔴 V8 BLOCKED — BTC below daily SMA200 (bear market), no longs`); return false; }
     if (result.side === "short" &&  _btcDailyBull) { console.log(`  🟢 V8 BLOCKED — BTC above daily SMA200 (bull market), no shorts`); return false; }
   }
@@ -1945,7 +2008,7 @@ async function processDipBuyer(asset, log) {
   }
 
   // ── V2: Max concurrent positions cap ────────────────────────────────────
-  const totalOpen = allPos.filter((p) => (p.status === "open" || p.status === "pending_limit") && p.strategy === "dip_buyer").length;
+  const totalOpen = allPos.filter((p) => (p.status === "open" || p.status === "pending_limit") && (p.strategy === "dip_buyer" || p.strategy === "combo_v1")).length;
   if (DIP_V2_ENABLED && totalOpen >= DIP_V2_MAX_CONCURRENT) {
     console.log(`  🚦 BLOCKED — ${totalOpen}/${DIP_V2_MAX_CONCURRENT} concurrent positions open. Waiting for exit.`);
     return false;
@@ -2337,17 +2400,19 @@ Bot resumes automatically tomorrow. 🔄`
     console.log(`  ⚠️  BTC regime check failed: ${e.message}`);
   }
 
-  // ── V8: BTC daily macro gate — fetch once per run ────────────────────────
-  if (V8_BTC_MACRO_GATE) {
+  // ── BTC daily macro gate — fetch once per run ────────────────────────────
+  // Always fetch when combo_v1 is in use (macro gate is core to the strategy)
+  const needsBtcMacro = V8_BTC_MACRO_GATE || WATCHLIST.some(a => a.strategy === "combo_v1");
+  if (needsBtcMacro) {
     try {
       const btcDaily  = await fetchCandles("BTC-USDT", "1D", 210);
       const dc        = btcDaily.map(c => c.close);
       const dSma200   = calcSMA(dc, 200);
       const dLast     = dc[dc.length - 1];
       _btcDailyBull   = dSma200 !== null && dLast > dSma200;
-      console.log(`\n  📊 V8 BTC Daily: $${dLast.toFixed(0)} vs SMA200=$${dSma200?.toFixed(0)} → ${_btcDailyBull ? "🟢 BULL — longs allowed" : "🔴 BEAR — longs blocked"}`);
+      console.log(`\n  📊 BTC Daily: $${dLast.toFixed(0)} vs SMA200=$${dSma200?.toFixed(0)} → ${_btcDailyBull ? "🟢 BULL" : "🔴 BEAR"}`);
     } catch (e) {
-      console.log(`  ⚠️  V8 BTC daily fetch failed: ${e.message} — macro gate skipped`);
+      console.log(`  ⚠️  BTC daily fetch failed: ${e.message} — macro gate skipped`);
       _btcDailyBull = null;
     }
   }
